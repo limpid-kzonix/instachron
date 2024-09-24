@@ -1,0 +1,8 @@
+#!/bin/zsh
+
+IMAGE_PATH=${IMAGE_PATH}
+YOUTUBE_URL=${YOUTUBE_URL}
+
+while true; do 
+	ffmpeg -re -loop 1 -i "$IMAGE_PATH" -c:v libx264 -pix_fmt yuv420p -preset fast -f flv "$YOUTUBE_URL"
+done
