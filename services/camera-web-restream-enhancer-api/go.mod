@@ -1,8 +1,9 @@
 module github.com/w0rxbend/instachron/services/camera-web-restream-enhancer-api
 
-go 1.22.5
+go 1.25.0
 
 require (
+	github.com/disintegration/gift v1.2.1
 	github.com/disintegration/imaging v1.6.2
 	github.com/w0rxbend/instachron/shared/mjpeg v0.0.0
 	github.com/w0rxbend/instachron/shared/restream v0.0.0
@@ -11,9 +12,8 @@ require (
 )
 
 require (
-	github.com/disintegration/gift v1.2.1 // indirect
 	github.com/w0rxbend/instachron/shared/cameras v0.0.0 // indirect
-	golang.org/x/image v0.0.0-20191009234506-e7c1f5e7dbb8 // indirect
+	golang.org/x/image v0.41.0 // indirect
 )
 
 replace (
