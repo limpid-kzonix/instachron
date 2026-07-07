@@ -1,6 +1,6 @@
 module github.com/w0rxbend/instachron/services/camera-web-restream-detector-api
 
-go 1.22.5
+go 1.25.0
 
 require (
 	github.com/disintegration/imaging v1.6.2
@@ -9,7 +9,7 @@ require (
 	github.com/w0rxbend/instachron/shared/streamproto v0.0.0
 	github.com/w0rxbend/instachron/shared/webui v0.0.0
 	github.com/yalue/onnxruntime_go v1.30.1
-	golang.org/x/image v0.23.0
+	golang.org/x/image v0.41.0
 )
 
 require github.com/w0rxbend/instachron/shared/cameras v0.0.0 // indirect
