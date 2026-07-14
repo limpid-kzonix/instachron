@@ -1,6 +1,6 @@
 module github.com/w0rxbend/instachron/services/camera-web-restream-upscaler-api
 
-go 1.22.5
+go 1.25.0
 
 require (
 	github.com/disintegration/imaging v1.6.2
@@ -12,7 +12,7 @@ require (
 
 require (
 	github.com/w0rxbend/instachron/shared/cameras v0.0.0 // indirect
-	golang.org/x/image v0.0.0-20191009234506-e7c1f5e7dbb8 // indirect
+	golang.org/x/image v0.41.0 // indirect
 )
 
 replace (
