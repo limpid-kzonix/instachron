@@ -1,5 +1,6 @@
 FROM golang:1.26-alpine AS builder
 WORKDIR /src
+COPY shared/dropchan/     shared/dropchan/
 COPY shared/envconf/      shared/envconf/
 COPY shared/frameipc/     shared/frameipc/
 COPY shared/livefeed/     shared/livefeed/

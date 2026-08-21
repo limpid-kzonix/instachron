@@ -2,6 +2,7 @@ FROM golang:1.22-alpine AS builder
 WORKDIR /src
 
 # go.mod + go.sum first for layer-cached dependency download
+COPY shared/dropchan/go.mod     shared/dropchan/
 COPY shared/envconf/go.mod      shared/envconf/
 COPY shared/imageutil/go.mod    shared/imageutil/
 COPY shared/livefeed/go.mod     shared/livefeed/
@@ -15,6 +16,7 @@ WORKDIR /src/services/camera-web-restream-enhancer-api
 RUN GOWORK=off go mod download
 
 WORKDIR /src
+COPY shared/dropchan/     shared/dropchan/
 COPY shared/envconf/      shared/envconf/
 COPY shared/imageutil/    shared/imageutil/
 COPY shared/livefeed/     shared/livefeed/
