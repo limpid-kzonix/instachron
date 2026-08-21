@@ -7,9 +7,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/w0rxbend/instachron/shared/dropchan"
+
 	"github.com/disintegration/imaging"
-	"github.com/w0rxbend/instachron/services/camera-web-restream-upscaler-api/internal/imageio"
 	"github.com/w0rxbend/instachron/services/camera-web-restream-upscaler-api/internal/metrics"
+	"github.com/w0rxbend/instachron/shared/imageutil"
 )
 
 type job struct {
@@ -17,57 +19,51 @@ type job struct {
 	pushFn func([]byte)
 }
 
+// Config holds the parameters of a worker pool. Every field is an int, so they
+// are named here rather than passed positionally: the compiler cannot tell a
+// width from a height, but a keyed struct literal makes each value self-labelling
+// at the call site.
+type Config struct {
+	Workers     int // number of upscaling goroutines
+	QueueSize   int // pending frames held before the oldest is dropped
+	JPEGQuality int // quality of the re-encoded output JPEG, 1-100
+	MaxWidth    int // input frames wider than this are capped before upscaling
+	MaxHeight   int // input frames taller than this are capped before upscaling
+	Scale       int // integer upscale factor, e.g. 2 for 2×
+}
+
 // Pool distributes Lanczos upscaling across a fixed set of goroutines.
 // The bounded queue drops the oldest pending frame when full to keep latency
 // bounded at the cost of dropped frames under sustained overload.
-// Pool implements restream.Processor via Process.
 type Pool struct {
-	queue       chan job
-	wg          sync.WaitGroup
-	metrics     *metrics.Pipeline
-	jpegQuality int
-	maxW, maxH  int
-	scale       int
+	queue   chan job
+	wg      sync.WaitGroup
+	metrics *metrics.Pipeline
+	cfg     Config
 }
 
-// New starts numWorkers goroutines and returns a ready Pool.
-// scale is the integer upscale factor (e.g. 2 for 2×). Factors that are a
-// power of two are decomposed into sequential 2× passes to avoid the soft
-// artifacts of a single large upscale.
-func New(numWorkers, queueSize, jpegQuality, maxW, maxH, scale int, m *metrics.Pipeline) *Pool {
+// New starts cfg.Workers goroutines and returns a ready Pool.
+// Scale factors that are a power of two are decomposed into sequential 2×
+// passes to avoid the soft artifacts of a single large upscale.
+func New(cfg Config, m *metrics.Pipeline) *Pool {
 	p := &Pool{
-		queue:       make(chan job, queueSize),
-		metrics:     m,
-		jpegQuality: jpegQuality,
-		maxW:        maxW,
-		maxH:        maxH,
-		scale:       scale,
+		queue:   make(chan job, cfg.QueueSize),
+		metrics: m,
+		cfg:     cfg,
 	}
-	for range numWorkers {
+	for range cfg.Workers {
 		p.wg.Add(1)
 		go p.workerLoop()
 	}
 	return p
 }
 
-// Process implements restream.Processor. It enqueues jpeg for upscaling and
-// arranges for push to be called with the result. Process is non-blocking:
+// Process enqueues jpeg for upscaling and arranges for push to be called with
+// the result. Process is non-blocking:
 // when the queue is full the oldest pending frame is evicted (drop-oldest).
 func (p *Pool) Process(jpeg []byte, push func([]byte)) {
-	j := job{jpeg: jpeg, pushFn: push}
-	select {
-	case p.queue <- j:
-	default:
-		select {
-		case <-p.queue:
-			p.metrics.RecordDrop()
-		default:
-		}
-		select {
-		case p.queue <- j:
-		default:
-			p.metrics.RecordDrop()
-		}
+	if dropchan.Send(p.queue, job{jpeg: jpeg, pushFn: push}).Lost() {
+		p.metrics.RecordDrop()
 	}
 }
 
@@ -98,14 +94,14 @@ func (p *Pool) process(jpeg []byte, buf *bytes.Buffer) []byte {
 	tDecode := time.Since(t0)
 
 	t1 := time.Now()
-	src = imageio.CapResolution(src, p.maxW, p.maxH)
+	src = imageutil.CapResolution(src, p.cfg.MaxWidth, p.cfg.MaxHeight)
 	// Mild denoise before upscaling to suppress JPEG block noise.
 	src = imaging.Blur(src, 0.3)
-	dst := upscale(src, p.scale)
+	dst := upscale(src, p.cfg.Scale)
 	tResize := time.Since(t1)
 
 	t2 := time.Now()
-	out, err := imageio.EncodeJPEG(dst, p.jpegQuality, buf)
+	out, err := imageutil.EncodeJPEG(dst, p.cfg.JPEGQuality, buf)
 	if err != nil {
 		return nil
 	}

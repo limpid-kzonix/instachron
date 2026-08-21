@@ -15,12 +15,12 @@ import (
 
 type apiServer struct {
 	store   storage.Store
-	rec     *recorder.Manager
+	rec     *recorder.Sessions
 	metrics *metrics.Metrics
 	logger  *log.Logger
 }
 
-func newAPI(store storage.Store, rec *recorder.Manager, m *metrics.Metrics, logger *log.Logger) *apiServer {
+func newAPI(store storage.Store, rec *recorder.Sessions, m *metrics.Metrics, logger *log.Logger) *apiServer {
 	return &apiServer{store: store, rec: rec, metrics: m, logger: logger}
 }
 
@@ -85,7 +85,7 @@ func (s *apiServer) handleVideoFile(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "public, max-age=300")

@@ -11,23 +11,23 @@ import (
 func TestRoundTrip(t *testing.T) {
 	tests := []struct {
 		name string
-		msg  frameipc.Msg
+		msg  frameipc.Frame
 	}{
 		{
 			name: "frame with payload",
-			msg:  frameipc.Msg{Type: frameipc.TypeFrame, CameraID: 42, Payload: []byte{0xFF, 0xD8, 0xAA, 0xFF, 0xD9}},
+			msg:  frameipc.Frame{Kind: frameipc.KindFrame, CameraID: 42, Payload: []byte{0xFF, 0xD8, 0xAA, 0xFF, 0xD9}},
 		},
 		{
 			name: "offline with no payload",
-			msg:  frameipc.Msg{Type: frameipc.TypeOffline, CameraID: 7},
+			msg:  frameipc.Frame{Kind: frameipc.KindOffline, CameraID: 7},
 		},
 		{
 			name: "camera id zero",
-			msg:  frameipc.Msg{Type: frameipc.TypeFrame, CameraID: 0, Payload: []byte{1, 2, 3}},
+			msg:  frameipc.Frame{Kind: frameipc.KindFrame, CameraID: 0, Payload: []byte{1, 2, 3}},
 		},
 		{
 			name: "max camera id",
-			msg:  frameipc.Msg{Type: frameipc.TypeFrame, CameraID: 0xFFFFFFFF, Payload: []byte("jpeg")},
+			msg:  frameipc.Frame{Kind: frameipc.KindFrame, CameraID: 0xFFFFFFFF, Payload: []byte("jpeg")},
 		},
 	}
 
@@ -43,8 +43,8 @@ func TestRoundTrip(t *testing.T) {
 				t.Fatalf("Read: %v", err)
 			}
 
-			if got.Type != tc.msg.Type {
-				t.Errorf("Type = 0x%02x, want 0x%02x", got.Type, tc.msg.Type)
+			if got.Kind != tc.msg.Kind {
+				t.Errorf("Kind = %s, want %s", got.Kind, tc.msg.Kind)
 			}
 			if got.CameraID != tc.msg.CameraID {
 				t.Errorf("CameraID = %d, want %d", got.CameraID, tc.msg.CameraID)
@@ -74,7 +74,7 @@ func TestReadShortHeader(t *testing.T) {
 
 func TestReadTruncatedPayload(t *testing.T) {
 	var buf bytes.Buffer
-	msg := frameipc.Msg{Type: frameipc.TypeFrame, CameraID: 1, Payload: []byte{1, 2, 3, 4, 5}}
+	msg := frameipc.Frame{Kind: frameipc.KindFrame, CameraID: 1, Payload: []byte{1, 2, 3, 4, 5}}
 	if err := frameipc.Write(&buf, msg); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -87,10 +87,10 @@ func TestReadTruncatedPayload(t *testing.T) {
 }
 
 func TestMultipleMessages(t *testing.T) {
-	msgs := []frameipc.Msg{
-		{Type: frameipc.TypeFrame, CameraID: 1, Payload: []byte("frame1")},
-		{Type: frameipc.TypeOffline, CameraID: 2},
-		{Type: frameipc.TypeFrame, CameraID: 3, Payload: []byte("frame3")},
+	msgs := []frameipc.Frame{
+		{Kind: frameipc.KindFrame, CameraID: 1, Payload: []byte("frame1")},
+		{Kind: frameipc.KindOffline, CameraID: 2},
+		{Kind: frameipc.KindFrame, CameraID: 3, Payload: []byte("frame3")},
 	}
 
 	var buf bytes.Buffer
@@ -105,7 +105,7 @@ func TestMultipleMessages(t *testing.T) {
 		if err != nil {
 			t.Fatalf("msg %d Read: %v", i, err)
 		}
-		if got.Type != want.Type || got.CameraID != want.CameraID || !bytes.Equal(got.Payload, want.Payload) {
+		if got.Kind != want.Kind || got.CameraID != want.CameraID || !bytes.Equal(got.Payload, want.Payload) {
 			t.Errorf("msg %d: got %+v, want %+v", i, got, want)
 		}
 	}

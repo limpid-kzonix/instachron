@@ -3,11 +3,10 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/w0rxbend/instachron/services/camera-recorder/internal/config"
@@ -15,14 +14,19 @@ import (
 	"github.com/w0rxbend/instachron/services/camera-recorder/internal/metrics"
 	"github.com/w0rxbend/instachron/services/camera-recorder/internal/recorder"
 	"github.com/w0rxbend/instachron/services/camera-recorder/internal/storage"
-	"github.com/w0rxbend/instachron/shared/restream"
+	"github.com/w0rxbend/instachron/services/camera-recorder/internal/usage"
+	"github.com/w0rxbend/instachron/shared/envconf"
 	"github.com/w0rxbend/instachron/shared/streamproto"
 )
 
-func Run() {
+// Run starts the recorder and blocks until ctx is cancelled or the HTTP server
+// fails. Returning the error instead of exiting matters here: the deferred
+// rec.Close below is what stops the running ffmpeg encoders and finishes their
+// segments, and a call to os.Exit would skip it.
+func Run(ctx context.Context) error {
 	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
 
-	configPath := envString("CONFIG_FILE", config.DefaultPath)
+	configPath := envconf.String("CONFIG_FILE", config.DefaultPath)
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -30,23 +34,20 @@ func Run() {
 			cfg, err = config.Load("")
 		}
 		if err != nil {
-			logger.Fatalf("config failed: %v", err)
+			return fmt.Errorf("load config: %w", err)
 		}
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	store := storage.NewLocal(cfg.Storage.RootDir)
 	m := metrics.New()
-	rec := recorder.NewManager(recorder.Config{
+	rec := recorder.NewSessions(recorder.Config{
 		OutputFPS:             cfg.Recording.OutputFPS,
 		TimelapseFactor:       cfg.Recording.TimelapseFactor,
-		SegmentRawDuration:    cfg.SegmentRawDuration(),
+		SegmentRawDuration:    cfg.SegmentDuration(),
 		MaxFileBytes:          cfg.Recording.MaxFileBytes,
 		KeepFilesPerCamera:    cfg.Recording.KeepFilesPerCamera,
 		QueueSizePerCamera:    cfg.Recording.QueueSizePerCamera,
-		InactiveCloseDuration: cfg.InactiveCloseDuration(),
+		InactiveCloseDuration: cfg.InactiveTimeout(),
 		FFmpeg: encoder.Config{
 			Path:   cfg.FFmpeg.Path,
 			Preset: cfg.FFmpeg.Preset,
@@ -55,10 +56,10 @@ func Run() {
 	}, store, m, logger)
 	defer rec.Close()
 
-	go refreshUsage(ctx, store, m, logger)
+	go usage.Run(ctx, store, m, usage.DefaultInterval, logger)
 
-	upstream := restream.NewTCPUpstream(
-		restream.TCPUpstreamConfig{Addr: cfg.UpstreamTCPAddr},
+	upstream := streamproto.NewTCPUpstream(
+		streamproto.TCPUpstreamConfig{Addr: cfg.UpstreamTCPAddr},
 		func(f streamproto.Frame) {
 			rec.Submit(ctx, f)
 		},
@@ -86,30 +87,7 @@ func Run() {
 	logger.Printf("camera-recorder listening on %s upstream=%s storage=%s timelapse=%dx output_fps=%d",
 		cfg.HTTPAddr, cfg.UpstreamTCPAddr, cfg.Storage.RootDir, cfg.Recording.TimelapseFactor, cfg.Recording.OutputFPS)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Fatalf("HTTP server failed: %v", err)
+		return fmt.Errorf("http server on %s: %w", cfg.HTTPAddr, err)
 	}
-}
-
-func refreshUsage(ctx context.Context, store storage.Store, m *metrics.Metrics, logger *log.Logger) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	for {
-		if n, err := store.UsageBytes(ctx); err == nil {
-			m.SetStorageBytes(n)
-		} else if ctx.Err() == nil {
-			logger.Printf("storage usage: %v", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-func envString(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
+	return nil
 }

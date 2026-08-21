@@ -38,5 +38,5 @@ func TestLocalCompleteListAndOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 }

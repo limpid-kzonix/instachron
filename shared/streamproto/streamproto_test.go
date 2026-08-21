@@ -2,7 +2,6 @@ package streamproto_test
 
 import (
 	"bytes"
-	"context"
 	"testing"
 	"time"
 
@@ -21,12 +20,12 @@ func TestRoundTrip(t *testing.T) {
 
 	var buf bytes.Buffer
 	w := streamproto.NewWriter(&buf)
-	if err := w.WriteFrame(context.Background(), f); err != nil {
+	if err := w.WriteFrame(f); err != nil {
 		t.Fatal(err)
 	}
 
 	r := streamproto.NewReader(&buf)
-	got, err := r.ReadFrame(context.Background())
+	got, err := r.ReadFrame()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,13 +53,13 @@ func TestMultipleFramesRoundTrip(t *testing.T) {
 		f := streamproto.Frame{
 			Timestamp: time.Now(),
 			Sequence:  i,
-			CameraID:  uint32(i % 3),
+			CameraID:  streamproto.CameraID(i % 3),
 			Payload:   []byte{0xFF, 0xD8, byte(i), 0xFF, 0xD9},
 		}
-		if err := w.WriteFrame(context.Background(), f); err != nil {
+		if err := w.WriteFrame(f); err != nil {
 			t.Fatalf("write frame %d: %v", i, err)
 		}
-		got, err := r.ReadFrame(context.Background())
+		got, err := r.ReadFrame()
 		if err != nil {
 			t.Fatalf("read frame %d: %v", i, err)
 		}
@@ -75,7 +74,7 @@ func TestInvalidMagic(t *testing.T) {
 	var buf bytes.Buffer
 	buf.Write(make([]byte, 40)) // all zeros — bad magic
 	r := streamproto.NewReader(&buf)
-	_, err := r.ReadFrame(context.Background())
+	_, err := r.ReadFrame()
 	if err != streamproto.ErrInvalidMagic {
 		t.Fatalf("expected ErrInvalidMagic, got %v", err)
 	}
@@ -84,7 +83,7 @@ func TestInvalidMagic(t *testing.T) {
 func TestEmptyPayloadWrite(t *testing.T) {
 	var buf bytes.Buffer
 	w := streamproto.NewWriter(&buf)
-	err := w.WriteFrame(context.Background(), streamproto.Frame{Timestamp: time.Now()})
+	err := w.WriteFrame(streamproto.Frame{Timestamp: time.Now()})
 	if err != streamproto.ErrEmptyPayload {
 		t.Fatalf("expected ErrEmptyPayload, got %v", err)
 	}
@@ -97,7 +96,7 @@ func TestFrameTooLargeWrite(t *testing.T) {
 		Timestamp: time.Now(),
 		Payload:   make([]byte, streamproto.DefaultMaxFrameSize+1),
 	}
-	if err := w.WriteFrame(context.Background(), f); err != streamproto.ErrFrameTooLarge {
+	if err := w.WriteFrame(f); err != streamproto.ErrFrameTooLarge {
 		t.Fatalf("expected ErrFrameTooLarge, got %v", err)
 	}
 }
@@ -106,7 +105,7 @@ func TestTruncatedHeader(t *testing.T) {
 	var buf bytes.Buffer
 	buf.Write([]byte{'M', 'J', 'P', 'G'}) // only 4 bytes, header needs 32
 	r := streamproto.NewReader(&buf)
-	_, err := r.ReadFrame(context.Background())
+	_, err := r.ReadFrame()
 	if err == nil {
 		t.Fatal("expected error on truncated header, got nil")
 	}

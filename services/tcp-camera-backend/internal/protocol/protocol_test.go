@@ -1,7 +1,10 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
+	"io"
 	"testing"
 )
 
@@ -77,6 +80,100 @@ func TestLooksLikeJPEG(t *testing.T) {
 	invalidJPEG := []byte{0x00, 0xD8, 0xAA, 0xBB, 0xFF, 0x00}
 	if LooksLikeJPEG(invalidJPEG) {
 		t.Fatal("LooksLikeJPEG returned true for invalid JPEG markers")
+	}
+}
+
+func TestReadHeader(t *testing.T) {
+	// fixedBytes builds the 16 bytes that both frame variants start with.
+	fixedBytes := func(magic, sequence, payloadSize, timestampMs uint32) []byte {
+		header := make([]byte, HeaderSize)
+		binary.BigEndian.PutUint32(header[0:4], magic)
+		binary.BigEndian.PutUint32(header[4:8], sequence)
+		binary.BigEndian.PutUint32(header[8:12], payloadSize)
+		binary.BigEndian.PutUint32(header[12:16], timestampMs)
+		return header
+	}
+	cameraIDBytes := func(cameraID uint32) []byte {
+		raw := make([]byte, CameraIDSize)
+		binary.BigEndian.PutUint32(raw, cameraID)
+		return raw
+	}
+
+	tests := []struct {
+		name string
+		// input is the byte stream a camera would send.
+		input []byte
+		// want is the header expected when wantErr is nil.
+		want Header
+		// wantErr, when set, is the error ReadHeader must report through errors.Is.
+		wantErr error
+		// wantAnyErr marks a case whose failure has no sentinel to compare
+		// against, so the test only requires that some error came back.
+		wantAnyErr bool
+		// wantRemaining is how many bytes ReadHeader must leave unread.
+		wantRemaining int
+	}{
+		{
+			name:          "legacy header",
+			input:         append(fixedBytes(MagicLegacy, 42, 123456, 987654321), 0xAA),
+			want:          Header{CameraID: DefaultCameraID, Sequence: 42, PayloadSize: 123456, TimestampMs: 987654321},
+			wantRemaining: 1,
+		},
+		{
+			name:          "device header consumes the camera id bytes",
+			input:         append(append(fixedBytes(MagicWithDevice, 7, 64, 99), cameraIDBytes(17)...), 0xAA),
+			want:          Header{CameraID: 17, Sequence: 7, PayloadSize: 64, TimestampMs: 99},
+			wantRemaining: 1,
+		},
+		{
+			name:       "unknown magic",
+			input:      fixedBytes(0xDEADBEEF, 1, 2, 3),
+			wantAnyErr: true,
+		},
+		{
+			name:    "empty stream reports a clean end of file",
+			input:   nil,
+			wantErr: io.EOF,
+		},
+		{
+			name:    "truncated fixed bytes",
+			input:   fixedBytes(MagicLegacy, 1, 2, 3)[:8],
+			wantErr: io.ErrUnexpectedEOF,
+		},
+		{
+			name:    "truncated camera id",
+			input:   append(fixedBytes(MagicWithDevice, 1, 2, 3), 0x00, 0x00),
+			wantErr: io.ErrUnexpectedEOF,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := bytes.NewReader(tt.input)
+			got, err := ReadHeader(reader)
+
+			switch {
+			case tt.wantAnyErr:
+				if err == nil {
+					t.Fatalf("ReadHeader returned nil error, want an error")
+				}
+				return
+			case tt.wantErr != nil:
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("ReadHeader error = %v, want %v", err, tt.wantErr)
+				}
+				return
+			case err != nil:
+				t.Fatalf("ReadHeader returned error: %v", err)
+			}
+
+			if got != tt.want {
+				t.Fatalf("ReadHeader = %+v, want %+v", got, tt.want)
+			}
+			if reader.Len() != tt.wantRemaining {
+				t.Fatalf("unread bytes = %d, want %d", reader.Len(), tt.wantRemaining)
+			}
+		})
 	}
 }
 

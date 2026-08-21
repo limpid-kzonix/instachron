@@ -3,6 +3,8 @@ package recorder
 import (
 	"testing"
 	"time"
+
+	"github.com/w0rxbend/instachron/shared/imageutil"
 )
 
 func TestShouldKeepAppliesTimelapseInterval(t *testing.T) {
@@ -22,10 +24,10 @@ func TestShouldKeepAppliesTimelapseInterval(t *testing.T) {
 }
 
 func TestLooksLikeJPEG(t *testing.T) {
-	if !looksLikeJPEG([]byte{0xFF, 0xD8, 0x00, 0xFF, 0xD9}) {
+	if !imageutil.LooksLikeJPEG([]byte{0xFF, 0xD8, 0x00, 0xFF, 0xD9}) {
 		t.Fatal("valid JPEG markers were rejected")
 	}
-	if looksLikeJPEG([]byte{0x00, 0xD8, 0x00, 0xFF, 0x00}) {
+	if imageutil.LooksLikeJPEG([]byte{0x00, 0xD8, 0x00, 0xFF, 0x00}) {
 		t.Fatal("invalid JPEG markers were accepted")
 	}
 }

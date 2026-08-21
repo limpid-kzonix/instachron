@@ -7,15 +7,12 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
-	"github.com/w0rxbend/instachron/services/camera-web-api/internal/camera"
-	"github.com/w0rxbend/instachron/services/camera-web-api/internal/httpapi"
 	"github.com/w0rxbend/instachron/services/camera-web-api/internal/ipcclient"
 	"github.com/w0rxbend/instachron/services/camera-web-api/internal/rotation"
-	"github.com/w0rxbend/instachron/shared/restream"
+	"github.com/w0rxbend/instachron/shared/envconf"
+	"github.com/w0rxbend/instachron/shared/livefeed"
 	"github.com/w0rxbend/instachron/shared/streamproto"
 )
 
@@ -27,51 +24,41 @@ const (
 	defaultMaxClients   = 64
 )
 
-func Run() {
+// Run serves the camera web API until ctx is cancelled. Frames arrive over a
+// local IPC socket from the capture process, are rotated if the camera is
+// configured that way, and are then published to both HTTP clients and
+// downstream TCP proxies.
+func Run(ctx context.Context) error {
 	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
 
-	addr := envString("HTTP_ADDR", defaultAddr)
-	socketPath := envString("IPC_SOCKET_PATH", defaultSocketPath)
-	cameraConfigPath := envString("CAMERA_CONFIG", defaultCameraConfig)
-	tcpAddr := envString("TCP_ADDR", defaultTCPAddr)
-	tcpEnabled := envString("TCP_ENABLED", "true") != "false"
+	addr := envconf.String("HTTP_ADDR", defaultAddr)
+	socketPath := envconf.String("IPC_SOCKET_PATH", defaultSocketPath)
+	cameraConfigPath := envconf.String("CAMERA_CONFIG", defaultCameraConfig)
+	tcpAddr := envconf.String("TCP_ADDR", defaultTCPAddr)
+	tcpEnabled := envconf.String("TCP_ENABLED", "true") != "false"
 
-	rotCfg, err := rotation.Load(cameraConfigPath, logger)
+	rotCfg, rotEntries, err := rotation.Load(cameraConfigPath)
 	if err != nil {
-		logger.Fatalf("load rotation config: %v", err)
+		return fmt.Errorf("load rotation config: %w", err)
 	}
+	logger.Printf("rotation config loaded from %s: %d entries", cameraConfigPath, rotEntries)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	manager := camera.NewManager()
-
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				manager.CheckLiveness()
-			}
-		}
-	}()
+	registry := livefeed.NewRegistry()
+	go registry.RunLiveness(ctx, time.Second)
 
 	// broadcaster fans frames out to TCP downstream clients (proxy-to-proxy transport)
-	broadcaster := restream.NewBroadcaster()
+	broadcaster := livefeed.NewBroadcaster()
 
 	// per-camera sequence counters; only written by the single IPC reader goroutine
-	seqs := make(map[uint32]uint64)
+	seqs := make(map[streamproto.CameraID]uint64)
 
 	reader := ipcclient.New(socketPath, ipcclient.Handler{
-		OnFrame: func(cameraID uint32, jpeg []byte) {
-			id := fmt.Sprintf("%d", cameraID)
-			if deg := rotCfg.Get(id); deg != 0 {
-				jpeg = rotation.Apply(jpeg, deg)
+		OnFrame: func(cameraID streamproto.CameraID, jpeg []byte) {
+			id := cameraID.String()
+			if angle := rotCfg.Get(id); !angle.IsZero() {
+				jpeg = rotation.Apply(jpeg, angle)
 			}
-			manager.Push(id, jpeg)
+			registry.Push(id, jpeg)
 
 			seqs[cameraID]++
 			broadcaster.Publish(streamproto.Frame{
@@ -81,15 +68,15 @@ func Run() {
 				Payload:   jpeg,
 			})
 		},
-		OnOffline: func(cameraID uint32) {
-			manager.MarkOffline(fmt.Sprintf("%d", cameraID))
+		OnOffline: func(cameraID streamproto.CameraID) {
+			registry.MarkOffline(cameraID.String())
 		},
-		OnDisconnect: manager.MarkAllOffline,
+		OnDisconnect: registry.MarkAllOffline,
 	}, logger)
 	go reader.Run(ctx)
 
 	if tcpEnabled {
-		tcpSrv := restream.NewTCPServer(restream.TCPServerConfig{
+		tcpSrv := streamproto.NewTCPServer(streamproto.TCPServerConfig{
 			ListenAddr:   tcpAddr,
 			MaxClients:   defaultMaxClients,
 			WriteTimeout: 2 * time.Second,
@@ -101,10 +88,19 @@ func Run() {
 		}()
 	}
 
-	h := httpapi.New(manager, rotCfg, logger)
+	api := livefeed.NewCameraAPI(registry, logger, livefeed.APIOptions{
+		Rotation: rotCfg.Degrees,
+		// This service talks to the cameras directly, so a viewer may well open
+		// a stream before a camera has connected. Attaching to a camera that
+		// has sent nothing yet lets that viewer wait rather than get a 404.
+		CreateOnSubscribe: true,
+		// Humans point their browsers at this service, so knowing who attached
+		// and when is worth a log line.
+		LogSubscribers: true,
+	})
 	httpSrv := &http.Server{
 		Addr:        addr,
-		Handler:     h.Routes(),
+		Handler:     api,
 		ReadTimeout: 10 * time.Second,
 	}
 
@@ -119,14 +115,9 @@ func Run() {
 
 	logger.Printf("camera-web-api listening on %s  ipc=%s  tcp=%s (enabled=%v)",
 		addr, socketPath, tcpAddr, tcpEnabled)
+	// ErrServerClosed is the expected result of the shutdown above, not a failure.
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Fatalf("HTTP server failed: %v", err)
+		return fmt.Errorf("HTTP server failed: %w", err)
 	}
-}
-
-func envString(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
+	return nil
 }

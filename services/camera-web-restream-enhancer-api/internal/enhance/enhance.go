@@ -3,11 +3,10 @@ package enhance
 
 import (
 	"bytes"
-	"encoding/json"
 	"image"
 	"image/color"
-	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/disintegration/gift"
 	"github.com/disintegration/imaging"
@@ -42,22 +41,6 @@ func DefaultCameraConfigs() CameraConfigs {
 		},
 		Cameras: make(map[string]Config),
 	}
-}
-
-// LoadCameraConfigs reads a JSON file at path and returns the parsed CameraConfigs.
-func LoadCameraConfigs(path string) (CameraConfigs, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return CameraConfigs{}, err
-	}
-	var cfgs CameraConfigs
-	if err := json.Unmarshal(data, &cfgs); err != nil {
-		return CameraConfigs{}, err
-	}
-	if cfgs.Cameras == nil {
-		cfgs.Cameras = make(map[string]Config)
-	}
-	return cfgs, nil
 }
 
 // filterRegistry is the built-in set of named gift filters available to configs.
@@ -108,37 +91,74 @@ var filterRegistry = map[string]gift.Filter{
 	),
 }
 
-// Processor applies the enhancement pipeline to raw JPEG frames.
-// ProcessCamera is the entry point, and is safe for concurrent use.
-type Processor struct {
-	cfgs    CameraConfigs
-	bufPool sync.Pool
+// Stats is a snapshot of how the enhancement pipeline has been doing.
+//
+// It exists because a frame that cannot be decoded or encoded is passed through
+// untouched rather than dropped, which is the right thing to do for a live video
+// feed — a slightly wrong frame beats a gap — but it means a camera whose frames
+// have silently stopped being enhanced looks exactly like a camera whose frames
+// need no enhancement. These counters are the difference between the two.
+type Stats struct {
+	// Processed is the total number of frames handed to ProcessCamera.
+	Processed uint64
+	// DecodeFailed counts frames whose JPEG could not be decoded, and which
+	// were therefore forwarded exactly as they arrived.
+	DecodeFailed uint64
+	// EncodeFailed counts frames that were enhanced successfully but could not
+	// be re-encoded, and which were therefore forwarded in their original form.
+	EncodeFailed uint64
 }
 
-// New returns a Processor driven by cfgs.
-func New(cfgs CameraConfigs) *Processor {
-	return &Processor{
+// Enhancer applies the enhancement pipeline to raw JPEG frames.
+// ProcessCamera is the entry point, and is safe for concurrent use.
+type Enhancer struct {
+	cfgs    CameraConfigs
+	bufPool sync.Pool
+
+	processed    atomic.Uint64
+	decodeFailed atomic.Uint64
+	encodeFailed atomic.Uint64
+}
+
+// New returns an Enhancer driven by cfgs.
+func New(cfgs CameraConfigs) *Enhancer {
+	return &Enhancer{
 		cfgs:    cfgs,
 		bufPool: sync.Pool{New: func() any { return new(bytes.Buffer) }},
 	}
 }
 
 // ProcessCamera looks up the per-camera config (falling back to Default) and
-// enhances jpeg, calling push with the result.
-func (e *Processor) ProcessCamera(cameraID string, jpeg []byte, push func([]byte)) {
+// enhances jpeg, calling push with the result. A frame that cannot be decoded
+// or re-encoded is passed through unchanged and counted in Stats.
+func (e *Enhancer) ProcessCamera(cameraID string, jpeg []byte, push func([]byte)) {
+	e.processed.Add(1)
 	push(e.process(jpeg, e.configFor(cameraID)))
 }
 
-func (e *Processor) configFor(cameraID string) Config {
+// Stats returns a snapshot of the counters. The three values are read
+// independently, so a snapshot taken while frames are in flight may show
+// slightly inconsistent totals; that is fine for reporting and avoids putting a
+// lock on the per-frame path.
+func (e *Enhancer) Stats() Stats {
+	return Stats{
+		Processed:    e.processed.Load(),
+		DecodeFailed: e.decodeFailed.Load(),
+		EncodeFailed: e.encodeFailed.Load(),
+	}
+}
+
+func (e *Enhancer) configFor(cameraID string) Config {
 	if cfg, ok := e.cfgs.Cameras[cameraID]; ok {
 		return cfg
 	}
 	return e.cfgs.Default
 }
 
-func (e *Processor) process(jpeg []byte, cfg Config) []byte {
+func (e *Enhancer) process(jpeg []byte, cfg Config) []byte {
 	img, err := imaging.Decode(bytes.NewReader(jpeg))
 	if err != nil {
+		e.decodeFailed.Add(1)
 		return jpeg
 	}
 
@@ -150,6 +170,7 @@ func (e *Processor) process(jpeg []byte, cfg Config) []byte {
 	defer e.bufPool.Put(buf)
 
 	if err := imaging.Encode(buf, img, imaging.JPEG, imaging.JPEGQuality(cfg.JPEGQuality)); err != nil {
+		e.encodeFailed.Add(1)
 		return jpeg
 	}
 

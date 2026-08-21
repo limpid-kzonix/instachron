@@ -1,10 +1,12 @@
 go 1.22.5
 
 use (
-	./shared/cameras
+	./shared/envconf
+	./shared/dropchan
 	./shared/frameipc
+	./shared/imageutil
 	./shared/mjpeg
-	./shared/restream
+	./shared/livefeed
 	./shared/streamproto
 	./shared/webui
 	./services/camera-web-api

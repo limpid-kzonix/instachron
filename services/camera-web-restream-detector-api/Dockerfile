@@ -12,11 +12,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certifi
 FROM golang:1.22 AS builder
 WORKDIR /src
 
-COPY shared/cameras/go.mod                                    shared/cameras/
-COPY shared/mjpeg/go.mod                                      shared/mjpeg/
-COPY shared/restream/go.mod                                   shared/restream/
-COPY shared/streamproto/go.mod                                shared/streamproto/
-COPY shared/webui/go.mod                                      shared/webui/
+COPY shared/envconf/go.mod      shared/envconf/
+COPY shared/imageutil/go.mod    shared/imageutil/
+COPY shared/livefeed/go.mod     shared/livefeed/
+COPY shared/mjpeg/go.mod        shared/mjpeg/
+COPY shared/streamproto/go.mod  shared/streamproto/
+COPY shared/webui/go.mod        shared/webui/
 COPY services/camera-web-restream-detector-api/go.mod \
      services/camera-web-restream-detector-api/go.sum \
      services/camera-web-restream-detector-api/
@@ -24,11 +25,12 @@ WORKDIR /src/services/camera-web-restream-detector-api
 RUN GOWORK=off go mod download
 
 WORKDIR /src
-COPY shared/cameras/     shared/cameras/
-COPY shared/mjpeg/       shared/mjpeg/
-COPY shared/restream/    shared/restream/
-COPY shared/streamproto/ shared/streamproto/
-COPY shared/webui/       shared/webui/
+COPY shared/envconf/      shared/envconf/
+COPY shared/imageutil/    shared/imageutil/
+COPY shared/livefeed/     shared/livefeed/
+COPY shared/mjpeg/        shared/mjpeg/
+COPY shared/streamproto/  shared/streamproto/
+COPY shared/webui/        shared/webui/
 COPY services/camera-web-restream-detector-api/ services/camera-web-restream-detector-api/
 
 WORKDIR /src/services/camera-web-restream-detector-api

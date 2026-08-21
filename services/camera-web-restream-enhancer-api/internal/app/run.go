@@ -2,125 +2,89 @@ package app
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
-	"github.com/w0rxbend/instachron/shared/restream"
-	"github.com/w0rxbend/instachron/shared/streamproto"
+	"github.com/w0rxbend/instachron/services/camera-web-restream-enhancer-api/internal/config"
 	"github.com/w0rxbend/instachron/services/camera-web-restream-enhancer-api/internal/enhance"
+	"github.com/w0rxbend/instachron/shared/envconf"
+	"github.com/w0rxbend/instachron/shared/livefeed"
+	"github.com/w0rxbend/instachron/shared/streamproto"
 )
 
 const (
 	defaultAddr         = ":8091"
 	defaultUpstreamAddr = "localhost:9001"
 	defaultTCPAddr      = ":9003"
+	// defaultStatsInterval is how often the pass-through counters are logged.
+	defaultStatsInterval = 60 * time.Second
 )
 
-func Run() {
+// Run serves the enhancer proxy until ctx is cancelled. Every upstream frame is
+// passed through the per-camera enhancement pipeline before being republished.
+func Run(ctx context.Context) error {
 	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
 
-	addr := envString("HTTP_ADDR", defaultAddr)
-	upstreamTCPAddr := envString("UPSTREAM_TCP_ADDR", defaultUpstreamAddr)
-	tcpAddr := envString("TCP_ADDR", defaultTCPAddr)
-	tcpEnabled := envString("TCP_ENABLED", "true") != "false"
+	cfg := livefeed.ServiceConfig{
+		Name:            "camera-web-restream-enhancer-api",
+		HTTPAddr:        envconf.String("HTTP_ADDR", defaultAddr),
+		UpstreamTCPAddr: envconf.String("UPSTREAM_TCP_ADDR", defaultUpstreamAddr),
+		TCPAddr:         envconf.String("TCP_ADDR", defaultTCPAddr),
+		TCPEnabled:      envconf.String("TCP_ENABLED", "true") != "false",
+	}
 
-	configPath := envString("CONFIG_FILE", "config.json")
-	cameraCfgs, err := enhance.LoadCameraConfigs(configPath)
+	configPath := envconf.String("CONFIG_FILE", config.DefaultPath)
+	cameraCfgs, err := config.Load(configPath)
 	if err != nil {
-		logger.Printf("config file %q not found (%v), using built-in defaults", configPath, err)
-		cameraCfgs = enhance.DefaultCameraConfigs()
+		logger.Printf("%v — using built-in defaults", err)
 	} else {
 		logger.Printf("loaded enhancer config from %s (%d camera overrides)", configPath, len(cameraCfgs.Cameras))
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	enhancer := enhance.New(cameraCfgs)
+	statsInterval := envconf.Seconds("STATS_INTERVAL_SEC", defaultStatsInterval)
+	go reportStats(ctx, enhancer, statsInterval, logger)
 
-	manager := restream.NewManager()
-	proc := enhance.New(cameraCfgs)
-
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				manager.CheckLiveness()
-			}
-		}
-	}()
-
-	// broadcaster fans enhanced frames to downstream TCP proxy clients
-	broadcaster := restream.NewBroadcaster()
-
-	if tcpEnabled {
-		tcpSrv := restream.NewTCPServer(restream.TCPServerConfig{
-			ListenAddr:   tcpAddr,
-			MaxClients:   64,
-			WriteTimeout: 2 * time.Second,
-		}, broadcaster, logger)
-		go func() {
-			if err := tcpSrv.Run(ctx); err != nil {
-				logger.Printf("TCP server error: %v", err)
-			}
-		}()
+	transform := func(f streamproto.Frame, push func([]byte)) {
+		enhancer.ProcessCamera(f.CameraID.String(), f.Payload, push)
 	}
 
-	upstream := restream.NewTCPUpstream(
-		restream.TCPUpstreamConfig{Addr: upstreamTCPAddr},
-		func(f streamproto.Frame) {
-			id := fmt.Sprintf("%d", f.CameraID)
-			proc.ProcessCamera(id, f.Payload, func(processed []byte) {
-				pf := streamproto.Frame{
-					CameraID:  f.CameraID,
-					Timestamp: f.Timestamp,
-					Sequence:  f.Sequence,
-					Payload:   processed,
-				}
-				broadcaster.Publish(pf)
-				manager.Push(id, processed)
-			})
-		},
-		manager.MarkAllOffline,
-		logger,
-	)
-	go upstream.Run(ctx)
-
-	api := &apiServer{manager: manager, logger: logger}
-	httpSrv := &http.Server{
-		Addr:        addr,
-		Handler:     api.routes(),
-		ReadTimeout: 10 * time.Second,
-	}
-
-	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := httpSrv.Shutdown(shutCtx); err != nil {
-			logger.Printf("HTTP shutdown error: %v", err)
-		}
-	}()
-
-	logger.Printf("camera-web-restream-enhancer-api listening on %s  upstream=%s  tcp=%s (enabled=%v)",
-		addr, upstreamTCPAddr, tcpAddr, tcpEnabled)
-	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Fatalf("HTTP server failed: %v", err)
-	}
+	return livefeed.Serve(ctx, cfg, transform, logger)
 }
 
-func envString(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+// reportStats logs the enhancer's counters every interval until ctx is
+// cancelled. Only the change since the previous line is reported, so a steady
+// stream of "0 passed through" lines means the pipeline is healthy right now
+// rather than that it was healthy at some point since startup. Nothing is
+// logged while the service is idle, to keep a quiet night quiet.
+func reportStats(ctx context.Context, e *enhance.Enhancer, interval time.Duration, logger *log.Logger) {
+	if interval <= 0 {
+		return
 	}
-	return fallback
-}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
+	var prev enhance.Stats
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cur := e.Stats()
+			frames := cur.Processed - prev.Processed
+			decodeFailed := cur.DecodeFailed - prev.DecodeFailed
+			encodeFailed := cur.EncodeFailed - prev.EncodeFailed
+			prev = cur
+			if frames == 0 {
+				continue
+			}
+			if decodeFailed == 0 && encodeFailed == 0 {
+				logger.Printf("enhancer: %d frames enhanced", frames)
+				continue
+			}
+			logger.Printf("enhancer: %d frames, %d passed through undecodable, %d passed through unencodable",
+				frames, decodeFailed, encodeFailed)
+		}
+	}
+}

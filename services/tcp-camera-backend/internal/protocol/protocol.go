@@ -3,6 +3,11 @@ package protocol
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
+
+	"github.com/w0rxbend/instachron/shared/streamproto"
+
+	"github.com/w0rxbend/instachron/shared/imageutil"
 )
 
 const (
@@ -15,7 +20,7 @@ const (
 )
 
 type Header struct {
-	CameraID    uint32
+	CameraID    streamproto.CameraID
 	Sequence    uint32
 	PayloadSize uint32
 	TimestampMs uint32
@@ -52,20 +57,49 @@ func ParseDeviceHeader(header []byte, cameraIDBytes []byte) (Header, error) {
 		return Header{}, fmt.Errorf("invalid frame magic: 0x%08x", magic)
 	}
 	return Header{
-		CameraID:    binary.BigEndian.Uint32(cameraIDBytes),
+		CameraID:    streamproto.CameraID(binary.BigEndian.Uint32(cameraIDBytes)),
 		Sequence:    binary.BigEndian.Uint32(header[4:8]),
 		PayloadSize: binary.BigEndian.Uint32(header[8:12]),
 		TimestampMs: binary.BigEndian.Uint32(header[12:16]),
 	}, nil
 }
 
-func LooksLikeJPEG(payload []byte) bool {
-	if len(payload) < 4 {
-		return false
+// ReadHeader reads one complete frame header from r.
+//
+// The wire format has two variants that differ in length. Both start with the
+// same 16 fixed bytes, but a device frame (magic "JPGD") follows them with four
+// more bytes holding the camera id, while a legacy frame (magic "JPGS") does
+// not and is reported as coming from DefaultCameraID. Reading the magic and the
+// optional camera-id bytes in one place is what keeps a caller from stopping
+// after the 16 fixed bytes and leaving the camera id sitting unread on the
+// stream, where it would be mistaken for the start of the next frame.
+//
+// Failures from r are wrapped, so a caller can still recognise a client that
+// disconnected with errors.Is(err, io.EOF) or errors.Is(err, io.ErrUnexpectedEOF).
+func ReadHeader(r io.Reader) (Header, error) {
+	header := make([]byte, HeaderSize)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return Header{}, fmt.Errorf("read header: %w", err)
 	}
 
-	return payload[0] == 0xFF &&
-		payload[1] == 0xD8 &&
-		payload[len(payload)-2] == 0xFF &&
-		payload[len(payload)-1] == 0xD9
+	magic := binary.BigEndian.Uint32(header[0:4])
+	switch magic {
+	case MagicLegacy:
+		return ParseLegacyHeader(header)
+	case MagicWithDevice:
+		cameraIDBytes := make([]byte, CameraIDSize)
+		if _, err := io.ReadFull(r, cameraIDBytes); err != nil {
+			return Header{}, fmt.Errorf("read camera id: %w", err)
+		}
+		return ParseDeviceHeader(header, cameraIDBytes)
+	default:
+		return Header{}, fmt.Errorf("invalid frame magic: 0x%08x", magic)
+	}
+}
+
+// LooksLikeJPEG reports whether payload is plausibly a JPEG frame. It is kept
+// here, as a thin call through to the shared helper, because it is part of what
+// this package promises its callers about the frames it parses.
+func LooksLikeJPEG(payload []byte) bool {
+	return imageutil.LooksLikeJPEG(payload)
 }

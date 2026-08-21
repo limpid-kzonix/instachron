@@ -1,17 +1,25 @@
 FROM golang:1.26-alpine AS builder
 WORKDIR /src
 
-COPY shared/streamproto/go.mod                      shared/streamproto/
-COPY shared/cameras/go.mod                          shared/cameras/
-COPY shared/restream/go.mod                         shared/restream/
+COPY shared/dropchan/go.mod     shared/dropchan/
+COPY shared/envconf/go.mod      shared/envconf/
+COPY shared/imageutil/go.mod    shared/imageutil/
+COPY shared/livefeed/go.mod     shared/livefeed/
+COPY shared/mjpeg/go.mod        shared/mjpeg/
+COPY shared/streamproto/go.mod  shared/streamproto/
+COPY shared/webui/go.mod        shared/webui/
 COPY services/camera-recorder/go.mod                services/camera-recorder/
 WORKDIR /src/services/camera-recorder
 RUN GOWORK=off go mod download
 
 WORKDIR /src
-COPY shared/streamproto/                            shared/streamproto/
-COPY shared/cameras/                                shared/cameras/
-COPY shared/restream/                               shared/restream/
+COPY shared/dropchan/     shared/dropchan/
+COPY shared/envconf/      shared/envconf/
+COPY shared/imageutil/    shared/imageutil/
+COPY shared/livefeed/     shared/livefeed/
+COPY shared/mjpeg/        shared/mjpeg/
+COPY shared/streamproto/  shared/streamproto/
+COPY shared/webui/        shared/webui/
 COPY services/camera-recorder/                      services/camera-recorder/
 WORKDIR /src/services/camera-recorder
 RUN GOWORK=off CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/camera-recorder ./cmd/camera-recorder

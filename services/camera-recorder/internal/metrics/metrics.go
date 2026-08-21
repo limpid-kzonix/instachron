@@ -121,17 +121,17 @@ func (m *Metrics) ensureCamera(id string) *Camera {
 }
 
 func writeGauge(w io.Writer, name, help string, value float64) {
-	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %g\n", name, help, name, name, value)
+	_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %g\n", name, help, name, name, value)
 }
 
 func writeCounter(w io.Writer, name, help string, value float64) {
-	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %g\n", name, help, name, name, value)
+	_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %g\n", name, help, name, name, value)
 }
 
 func writeMetricHeader(w io.Writer, name, help, metricType string) {
-	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, metricType)
+	_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, metricType)
 }
 
 func writeSampleLabel(w io.Writer, name, cameraID string, value float64) {
-	fmt.Fprintf(w, "%s{camera_id=%q} %g\n", name, cameraID, value)
+	_, _ = fmt.Fprintf(w, "%s{camera_id=%q} %g\n", name, cameraID, value)
 }

@@ -48,13 +48,35 @@ fmt:
 fmt-docker:
   docker run --rm -v "{{root}}":/src -w /src golang:1.22-alpine sh -c 'gofmt -w $(find services shared -name "*.go")'
 
-# Run all Go tests using the local Go toolchain.
+# Fail if any Go file is not gofmt-formatted (checks only, never rewrites).
+fmt-check:
+  @unformatted="$(gofmt -l $(find services shared -name '*.go'))"; \
+  if [ -n "$unformatted" ]; then \
+    printf 'these files are not gofmt-formatted (run: just fmt):\n%s\n' "$unformatted"; \
+    exit 1; \
+  fi
+
+# This repository is a Go workspace made of several separate modules (every
+# directory holding its own go.mod). From the repository root `go test ./...`
+# matches no packages at all and exits without running a single test, so each
+# module directory has to be entered and tested on its own.
+# Run all Go tests using the local Go toolchain, one module at a time.
 test:
-  go test ./...
+  for m in $(find services shared -name go.mod | xargs -n1 dirname | sort); do \
+    printf '\n=== %s ===\n' "$m"; \
+    (cd "$m" && go test ./...) || exit 1; \
+  done
+
+# Run `go vet` over every module, same per-module walk as `test`.
+vet:
+  for m in $(find services shared -name go.mod | xargs -n1 dirname | sort); do \
+    printf '\n=== %s ===\n' "$m"; \
+    (cd "$m" && go vet ./...) || exit 1; \
+  done
 
 # Run all Go tests through the Go Docker image.
 test-docker:
-  docker run --rm -v "{{root}}":/src -w /src golang:1.22-alpine sh -c 'go test ./...'
+  docker run --rm -v "{{root}}":/src -w /src golang:1.22-alpine sh -c 'for m in $(find services shared -name go.mod | xargs -n1 dirname | sort); do printf "\n=== %s ===\n" "$m"; (cd "$m" && go test ./...) || exit 1; done'
 
 # Run tests for one service/module through the Go Docker image.
 test-docker-module module:

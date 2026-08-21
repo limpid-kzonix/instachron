@@ -11,18 +11,35 @@ type Detection struct {
 	X2, Y2     float32 // bottom-right
 }
 
+// parseParams groups everything parseOutput needs besides the raw model output.
+// These values travel together and are all either thresholds or facts about the
+// frame the output belongs to, so passing them as one value keeps the call site
+// readable: with seven positional parameters, two of which are floats and two
+// of which are ints, a transposed pair of arguments would still compile and
+// would silently produce wrong boxes.
+type parseParams struct {
+	// Layout says how the model's output tensor is arranged in memory.
+	Layout OutputLayout
+	// ConfThreshold is the minimum class score for a box to be considered.
+	ConfThreshold float32
+	// NMSThreshold is the overlap above which two boxes of the same class are
+	// treated as the same object, and the lower-scoring one is discarded.
+	NMSThreshold float32
+	// Letterbox describes how the frame was scaled and padded to reach the
+	// model's input size, and knows how to undo that mapping.
+	Letterbox letterboxResult
+	// OrigW and OrigH are the dimensions of the frame before letterboxing, and
+	// therefore the bounds that detections are clamped to.
+	OrigW, OrigH int
+}
+
 // parseOutput decodes YOLOv8 ONNX output into filtered, NMS-applied detections
 // mapped to original image space. It handles both common export layouts:
 //
-//	[1, 4+classes, boxes] — channel-first  (layout.Transposed == false)
-//	[1, boxes, 4+classes] — boxes-first    (layout.Transposed == true)
-func parseOutput(
-	data []float32,
-	layout OutputLayout,
-	confThresh, nmsThresh float32,
-	lb letterboxResult,
-	origW, origH int,
-) []Detection {
+//	[1, 4+classes, boxes] — channel-first  (p.Layout.Transposed == false)
+//	[1, boxes, 4+classes] — boxes-first    (p.Layout.Transposed == true)
+func parseOutput(data []float32, p parseParams) []Detection {
+	layout := p.Layout
 	numBoxes := layout.NumBoxes
 	numClasses := layout.NumChannels - 4
 
@@ -50,7 +67,7 @@ func parseOutput(
 				bestClass = c
 			}
 		}
-		if bestScore < confThresh {
+		if bestScore < p.ConfThreshold {
 			continue
 		}
 
@@ -59,20 +76,17 @@ func parseOutput(
 		w := at(2, i)
 		h := at(3, i)
 
-		// convert to corners in letterboxed space
+		// The model reports each box as a centre point with a width and a
+		// height; the rest of this package works in corners, so convert.
 		bx1 := cx - w/2
 		by1 := cy - h/2
 		bx2 := cx + w/2
 		by2 := cy + h/2
 
-		// map back to original image space
-		s := lb.scale
-		pl := float32(lb.padLeft)
-		pt := float32(lb.padTop)
-		ox1 := clamp((bx1-pl)/s, 0, float32(origW))
-		oy1 := clamp((by1-pt)/s, 0, float32(origH))
-		ox2 := clamp((bx2-pl)/s, 0, float32(origW))
-		oy2 := clamp((by2-pt)/s, 0, float32(origH))
+		// Those corners are in the letterboxed square the model was fed, so map
+		// both of them back to where they belong in the original frame.
+		ox1, oy1 := p.Letterbox.toOriginal(bx1, by1, p.OrigW, p.OrigH)
+		ox2, oy2 := p.Letterbox.toOriginal(bx2, by2, p.OrigW, p.OrigH)
 
 		if ox2 <= ox1 || oy2 <= oy1 {
 			continue
@@ -94,7 +108,7 @@ func parseOutput(
 		})
 	}
 
-	return nms(candidates, nmsThresh)
+	return nms(candidates, p.NMSThreshold)
 }
 
 // nms applies per-class non-maximum suppression.

@@ -10,11 +10,35 @@ import (
 
 // letterboxResult carries the resize/pad parameters needed to map detections
 // back to the original image coordinate space.
+//
+// "Letterboxing" here means the same thing it means on a television: the image
+// is scaled to fit the model's fixed square input without distorting it, and
+// the leftover strips are filled with flat gray. The model therefore reports
+// boxes in the coordinates of that padded square, and every one of them has to
+// be translated back to where it belongs in the original frame. toOriginal does
+// that translation, and it lives here because scale, padLeft and padTop are the
+// only things it needs — keeping it next to them means no caller has to take
+// those three values apart and pass them around separately.
 type letterboxResult struct {
 	img     *image.NRGBA
 	scale   float32
 	padLeft int
 	padTop  int
+}
+
+// toOriginal maps one point from letterboxed coordinates back to coordinates in
+// the original image, clamped to the bounds origW×origH.
+//
+// The two steps undo letterbox in reverse order: subtract the padding that was
+// added around the scaled image, then divide by the scale that was applied.
+// Clamping matters because a model often predicts a box that runs slightly off
+// the edge of the object, and without it a detection could carry a negative
+// coordinate or one past the end of the frame — which would later be drawn
+// outside the image.
+func (lb letterboxResult) toOriginal(x, y float32, origW, origH int) (float32, float32) {
+	ox := clamp((x-float32(lb.padLeft))/lb.scale, 0, float32(origW))
+	oy := clamp((y-float32(lb.padTop))/lb.scale, 0, float32(origH))
+	return ox, oy
 }
 
 // letterbox resizes img to fit within targetW×targetH while preserving aspect

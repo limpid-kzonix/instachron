@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 
+	"github.com/w0rxbend/instachron/services/camera-web-restream-detector-api/internal/config"
 	"github.com/w0rxbend/instachron/services/camera-web-restream-detector-api/internal/detect"
 )
 
@@ -31,7 +32,10 @@ func main() {
 
 	logger := log.New(os.Stdout, "", log.LstdFlags)
 
-	cfg, err := detect.LoadConfig(configPath)
+	// Unlike the long-running service, this one-shot tool was handed a config
+	// path explicitly, so a config it cannot read is a mistake worth stopping
+	// for rather than something to paper over with defaults.
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}

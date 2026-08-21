@@ -2,18 +2,15 @@ package app
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
+	"strings"
 
-	"github.com/w0rxbend/instachron/shared/restream"
-	"github.com/w0rxbend/instachron/shared/streamproto"
+	"github.com/w0rxbend/instachron/services/camera-web-restream-detector-api/internal/config"
 	"github.com/w0rxbend/instachron/services/camera-web-restream-detector-api/internal/detect"
+	"github.com/w0rxbend/instachron/shared/envconf"
+	"github.com/w0rxbend/instachron/shared/livefeed"
+	"github.com/w0rxbend/instachron/shared/streamproto"
 )
 
 const (
@@ -22,53 +19,53 @@ const (
 	defaultTCPAddr      = ":9005"
 )
 
-func Run() {
+// frameProcessor turns one JPEG frame into the frame that gets published.
+type frameProcessor interface {
+	Process(jpeg []byte, push func([]byte))
+}
+
+// passthrough publishes frames unchanged; used when the model is unavailable.
+type passthrough struct{}
+
+func (passthrough) Process(jpeg []byte, push func([]byte)) { push(jpeg) }
+
+// Run serves the detector proxy until ctx is cancelled. Frames are annotated
+// with YOLOv8 bounding boxes when the model loads, and forwarded untouched when
+// it does not, so a missing model degrades the service rather than stopping it.
+func Run(ctx context.Context) error {
 	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
 
-	addr := tcpAddr(envString("HTTP_ADDR", defaultAddr))
-	upstreamTCPAddr := envString("UPSTREAM_TCP_ADDR", defaultUpstreamAddr)
-	tcpListenAddr := tcpAddr(envString("TCP_ADDR", defaultTCPAddr))
-	tcpEnabled := envString("TCP_ENABLED", "true") != "false"
-	configPath := envString("CONFIG_FILE", "config.json")
+	serviceCfg := livefeed.ServiceConfig{
+		Name:            "camera-web-restream-detector-api",
+		HTTPAddr:        normalizeListenAddr(envconf.String("HTTP_ADDR", defaultAddr)),
+		UpstreamTCPAddr: envconf.String("UPSTREAM_TCP_ADDR", defaultUpstreamAddr),
+		TCPAddr:         normalizeListenAddr(envconf.String("TCP_ADDR", defaultTCPAddr)),
+		TCPEnabled:      envconf.String("TCP_ENABLED", "true") != "false",
+	}
 
-	cfg, err := detect.LoadConfig(configPath)
+	configPath := envconf.String("CONFIG_FILE", config.DefaultPath)
+	cfg, err := config.Load(configPath)
 	if err != nil {
-		logger.Printf("config file %q not found (%v), using built-in defaults", configPath, err)
-		cfg = detect.DefaultConfig()
+		logger.Printf("%v — using built-in defaults", err)
 	} else {
 		logger.Printf("loaded detector config from %s (model=%s conf=%.2f nms=%.2f)",
 			configPath, cfg.ModelPath, cfg.ConfThreshold, cfg.NMSThreshold)
 	}
 
-	// ORT_LIB_PATH env var overrides whatever is in config.json, making it easy
-	// to point at a locally downloaded libonnxruntime.so without editing the file.
-	if v := envString("ORT_LIB_PATH", ""); v != "" {
-		cfg.OrtLibPath = v
-	}
-
 	logger.Printf("ORT library path: %q (override with ORT_LIB_PATH env var)", cfg.OrtLibPath)
 
 	// load the detector; fall back to passthrough if the model isn't available yet
-	var processor restream.Processor
+	var processor frameProcessor
 	det, err := detect.New(cfg, logger)
 	if err != nil {
 		logger.Printf("detector unavailable (%v) — frames will pass through unchanged", err)
 		logger.Printf("hint: download ONNX Runtime from https://github.com/microsoft/onnxruntime/releases and set ORT_LIB_PATH=/path/to/libonnxruntime.so.x.y.z")
-		processor = restream.Noop{}
+		processor = passthrough{}
 	} else {
 		logger.Printf("YOLOv8 detector ready (input %dx%d, %d classes, output %s)",
-			cfg.InputWidth, cfg.InputHeight, cfg.NumClasses,
-			func() string {
-				if det.Layout().Transposed {
-					return "transposed [1,boxes,channels]"
-				}
-				return "channel-first [1,channels,boxes]"
-			}())
+			cfg.InputWidth, cfg.InputHeight, cfg.NumClasses, det.Layout())
 		processor = det
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	if det != nil {
 		go func() {
@@ -77,93 +74,20 @@ func Run() {
 		}()
 	}
 
-	manager := restream.NewManager()
-
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				manager.CheckLiveness()
-			}
-		}
-	}()
-
-	broadcaster := restream.NewBroadcaster()
-
-	if tcpEnabled {
-		tcpSrv := restream.NewTCPServer(restream.TCPServerConfig{
-			ListenAddr:   tcpListenAddr,
-			MaxClients:   64,
-			WriteTimeout: 2 * time.Second,
-		}, broadcaster, logger)
-		go func() {
-			if err := tcpSrv.Run(ctx); err != nil {
-				logger.Printf("TCP server error: %v", err)
-			}
-		}()
+	transform := func(f streamproto.Frame, push func([]byte)) {
+		processor.Process(f.Payload, push)
 	}
 
-	upstream := restream.NewTCPUpstream(
-		restream.TCPUpstreamConfig{Addr: upstreamTCPAddr},
-		func(f streamproto.Frame) {
-			id := fmt.Sprintf("%d", f.CameraID)
-			processor.Process(f.Payload, func(annotated []byte) {
-				pf := streamproto.Frame{
-					CameraID:  f.CameraID,
-					Timestamp: f.Timestamp,
-					Sequence:  f.Sequence,
-					Payload:   annotated,
-				}
-				broadcaster.Publish(pf)
-				manager.Push(id, annotated)
-			})
-		},
-		manager.MarkAllOffline,
-		logger,
-	)
-	go upstream.Run(ctx)
-
-	api := &apiServer{manager: manager, logger: logger}
-	httpSrv := &http.Server{
-		Addr:        addr,
-		Handler:     api.routes(),
-		ReadTimeout: 10 * time.Second,
-	}
-
-	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := httpSrv.Shutdown(shutCtx); err != nil {
-			logger.Printf("HTTP shutdown error: %v", err)
-		}
-	}()
-
-	logger.Printf("camera-web-restream-detector-api listening on %s  upstream=%s  tcp=%s (enabled=%v)",
-		addr, upstreamTCPAddr, tcpListenAddr, tcpEnabled)
-	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Fatalf("HTTP server failed: %v", err)
-	}
+	return livefeed.Serve(ctx, serviceCfg, transform, logger)
 }
 
-func envString(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
+// normalizeListenAddr makes a listen address acceptable to net.Listen: a bare
+// port number such as "9005" has no colon, so ":" is prepended to turn it into
+// "all interfaces, port 9005". Anything already containing a colon is returned
+// unchanged.
+func normalizeListenAddr(v string) string {
+	if strings.Contains(v, ":") {
 		return v
-	}
-	return fallback
-}
-
-// tcpAddr normalises a listen address: if v is a bare port number (no colon),
-// prepends ":" so net.Listen doesn't reject it.
-func tcpAddr(v string) string {
-	for _, c := range v {
-		if c == ':' {
-			return v
-		}
 	}
 	return ":" + v
 }

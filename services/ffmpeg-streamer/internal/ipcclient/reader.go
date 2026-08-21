@@ -1,117 +1,84 @@
 // Package ipcclient connects to the tcp-camera-backend IPC Unix socket and
 // maintains the latest JPEG frame for each active camera. Used by ffmpeg-streamer
 // to pull the current frame for each camera at a configured frame rate.
+//
+// The connection lifecycle — dialling, reading, reconnecting — lives in
+// shared/frameipc. What is local to this service is the cache: camera-web-api
+// pushes each frame onward as it arrives, whereas ffmpeg-streamer is polled and
+// so has to hold on to the most recent frame per camera.
 package ipcclient
 
 import (
 	"context"
-	"fmt"
 	"log"
-	"net"
 	"sync"
 	"sync/atomic"
-	"time"
+
+	"github.com/w0rxbend/instachron/shared/streamproto"
 
 	"github.com/w0rxbend/instachron/shared/frameipc"
 )
 
-const reconnDelay = time.Second
-
 // Reader connects to the IPC socket and caches the latest JPEG per camera.
 // It reconnects automatically and clears all frames when the connection is lost.
 type Reader struct {
-	socketPath string
-	logger     *log.Logger
+	client *frameipc.Client
 
 	mu      sync.RWMutex
-	frames  map[uint32][]byte
+	frames  map[streamproto.CameraID][]byte
 	version atomic.Uint64
 }
 
 // New returns a Reader for the given socket path.
 func New(socketPath string, logger *log.Logger) *Reader {
-	return &Reader{
-		socketPath: socketPath,
-		logger:     logger,
-		frames:     make(map[uint32][]byte),
-	}
+	r := &Reader{frames: make(map[streamproto.CameraID][]byte)}
+	r.client = frameipc.NewClient(socketPath, frameipc.Handler{
+		OnFrame:      r.storeFrame,
+		OnOffline:    r.dropFrame,
+		OnDisconnect: r.dropAllFrames,
+	}, logger)
+	return r
 }
 
 // Run is the reconnect loop. It blocks until ctx is cancelled.
 func (r *Reader) Run(ctx context.Context) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		if err := r.connect(ctx); err != nil && ctx.Err() == nil {
-			r.logger.Printf("IPC disconnected (%v), retrying in %s", err, reconnDelay)
-		}
-
-		// Lost the connection — wipe frames so ffmpeg doesn't loop stale data.
-		r.mu.Lock()
-		r.frames = make(map[uint32][]byte)
-		r.mu.Unlock()
-		r.version.Add(1)
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(reconnDelay):
-		}
-	}
+	r.client.Run(ctx)
 }
 
-func (r *Reader) connect(ctx context.Context) error {
-	conn, err := net.Dial("unix", r.socketPath)
-	if err != nil {
-		return fmt.Errorf("dial %s: %w", r.socketPath, err)
-	}
-	defer conn.Close()
+func (r *Reader) storeFrame(cameraID streamproto.CameraID, jpeg []byte) {
+	r.mu.Lock()
+	r.frames[cameraID] = jpeg
+	r.mu.Unlock()
+	r.version.Add(1)
+}
 
-	r.logger.Printf("IPC connected to %s", r.socketPath)
+func (r *Reader) dropFrame(cameraID streamproto.CameraID) {
+	r.mu.Lock()
+	delete(r.frames, cameraID)
+	r.mu.Unlock()
+	r.version.Add(1)
+}
 
-	go func() {
-		<-ctx.Done()
-		conn.Close()
-	}()
-
-	for {
-		msg, err := frameipc.Read(conn)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return err
-		}
-
-		switch msg.Type {
-		case frameipc.TypeFrame:
-			r.mu.Lock()
-			r.frames[msg.CameraID] = msg.Payload
-			r.mu.Unlock()
-			r.version.Add(1)
-		case frameipc.TypeOffline:
-			r.mu.Lock()
-			delete(r.frames, msg.CameraID)
-			r.mu.Unlock()
-			r.version.Add(1)
-		}
-	}
+func (r *Reader) dropAllFrames() {
+	// Lost the connection — wipe frames so ffmpeg doesn't loop stale data.
+	r.mu.Lock()
+	r.frames = make(map[streamproto.CameraID][]byte)
+	r.mu.Unlock()
+	r.version.Add(1)
 }
 
 // Latest returns the most recent JPEG for a single camera, or nil if none.
-func (r *Reader) Latest(cameraID uint32) []byte {
+func (r *Reader) Latest(cameraID streamproto.CameraID) []byte {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.frames[cameraID]
 }
 
 // AllLatest returns a snapshot of the latest JPEG for every active camera.
-func (r *Reader) AllLatest() map[uint32][]byte {
+func (r *Reader) AllLatest() map[streamproto.CameraID][]byte {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	cp := make(map[uint32][]byte, len(r.frames))
+	cp := make(map[streamproto.CameraID][]byte, len(r.frames))
 	for id, f := range r.frames {
 		cp[id] = f
 	}

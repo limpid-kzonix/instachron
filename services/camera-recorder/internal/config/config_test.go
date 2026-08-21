@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
 
 func TestDefaultsValidate(t *testing.T) {
 	if err := Defaults().Validate(); err != nil {
@@ -25,5 +30,21 @@ func TestEnvOverrides(t *testing.T) {
 	}
 	if cfg.Recording.TimelapseFactor != 20 {
 		t.Fatalf("TimelapseFactor = %d, want 20", cfg.Recording.TimelapseFactor)
+	}
+}
+
+func TestLoadParsesDurations(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"recording": {"segment_raw_duration": "10m"}}`), 0o644); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if got := cfg.SegmentDuration(); got != 10*time.Minute {
+		t.Fatalf("SegmentDuration() = %v, want %v", got, 10*time.Minute)
 	}
 }

@@ -22,11 +22,9 @@ func NewLocal(root string) *Local {
 	return &Local{root: root}
 }
 
-type localPending struct {
-	PendingSegment
-	tmpPath   string
-	finalPath string
-}
+// errNotLocalSegment is returned when a *PendingSegment reaches Local without
+// having been created by Local.BeginSegment, so its paths are unknown.
+var errNotLocalSegment = errors.New("storage: pending segment was not created by Local")
 
 type countingFile struct {
 	*os.File
@@ -63,7 +61,7 @@ func (l *Local) BeginSegment(ctx context.Context, cameraID string, start time.Ti
 		return nil, err
 	}
 
-	p := &PendingSegment{
+	return &PendingSegment{
 		Info: SegmentInfo{
 			CameraID:        cameraID,
 			FileName:        fileName,
@@ -72,28 +70,33 @@ func (l *Local) BeginSegment(ctx context.Context, cameraID string, start time.Ti
 			OutputFPS:       outputFPS,
 			RelativePath:    filepath.ToSlash(filepath.Join("camera-"+safeName(cameraID), fileName)),
 		},
-		Writer: &countingFile{File: f},
-	}
-	return (&localPending{PendingSegment: *p, tmpPath: tmpPath, finalPath: finalPath}).asPending(), nil
+		// The writer remembers where the temporary file lives and where it has to
+		// end up, so CompleteSegment and DiscardSegment can recover both paths.
+		Writer: &localSegmentWriter{
+			SegmentWriter: &countingFile{File: f},
+			tmpPath:       tmpPath,
+			finalPath:     finalPath,
+		},
+	}, nil
 }
 
 func (l *Local) CompleteSegment(ctx context.Context, segment *PendingSegment, end time.Time) (SegmentInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return SegmentInfo{}, err
 	}
-	lp, err := localFromPending(segment)
-	if err != nil {
-		return SegmentInfo{}, err
+	w, ok := segment.Writer.(*localSegmentWriter)
+	if !ok {
+		return SegmentInfo{}, errNotLocalSegment
 	}
-	info := lp.Info
+	info := segment.Info
 	info.EndedAt = end.UTC()
 	info.RawDurationSec = end.Sub(info.StartedAt).Seconds()
-	info.SizeBytes = lp.Writer.BytesWritten()
+	info.SizeBytes = w.BytesWritten()
 
-	if err := os.Rename(lp.tmpPath, lp.finalPath); err != nil {
+	if err := os.Rename(w.tmpPath, w.finalPath); err != nil {
 		return SegmentInfo{}, err
 	}
-	if stat, err := os.Stat(lp.finalPath); err == nil {
+	if stat, err := os.Stat(w.finalPath); err == nil {
 		info.SizeBytes = stat.Size()
 	}
 	if err := l.writeMetadata(info); err != nil {
@@ -108,15 +111,15 @@ func (l *Local) DiscardSegment(ctx context.Context, segment *PendingSegment) err
 	if segment == nil {
 		return nil
 	}
-	lp, err := localFromPending(segment)
-	if err != nil {
-		return err
+	w, ok := segment.Writer.(*localSegmentWriter)
+	if !ok {
+		return errNotLocalSegment
 	}
 	_ = segment.Writer.Close()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return os.Remove(lp.tmpPath)
+	return os.Remove(w.tmpPath)
 }
 
 func (l *Local) Prune(ctx context.Context, cameraID string, keep int) error {
@@ -167,7 +170,7 @@ func (l *Local) List(ctx context.Context, filter ListFilter) ([]SegmentInfo, err
 			return nil, err
 		}
 		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".mp4") || e.Name() == "latest.mp4" {
+			if !isSegmentFile(e.Name(), e.IsDir()) {
 				continue
 			}
 			info, err := l.readMetadata(id, e.Name())
@@ -219,7 +222,7 @@ func (l *Local) UsageBytes(ctx context.Context) (int64, error) {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".mp4") || d.Name() == "latest.mp4" {
+		if !isSegmentFile(d.Name(), d.IsDir()) {
 			return nil
 		}
 		info, err := d.Info()
@@ -307,26 +310,17 @@ func validFileName(v string) bool {
 	return v != "" && !strings.Contains(v, "/") && !strings.Contains(v, "\\") && strings.HasSuffix(v, ".mp4")
 }
 
-func (p *localPending) asPending() *PendingSegment {
-	ps := p.PendingSegment
-	ps.Writer = &localSegmentWriter{SegmentWriter: p.Writer, tmpPath: p.tmpPath, finalPath: p.finalPath}
-	return &ps
+// isSegmentFile reports whether a directory entry is a finished recording.
+// "latest.mp4" is excluded because it is a symlink pointing at the newest
+// segment, so counting it would report the same recording twice.
+func isSegmentFile(name string, isDir bool) bool {
+	return !isDir && strings.HasSuffix(name, ".mp4") && name != "latest.mp4"
 }
 
+// localSegmentWriter is the writer handed out by BeginSegment. It wraps the
+// counting file with the two paths the completion and discard paths need.
 type localSegmentWriter struct {
 	SegmentWriter
 	tmpPath   string
 	finalPath string
-}
-
-func localFromPending(p *PendingSegment) (*localPending, error) {
-	w, ok := p.Writer.(*localSegmentWriter)
-	if !ok {
-		return nil, fmt.Errorf("storage: pending segment is not local")
-	}
-	return &localPending{
-		PendingSegment: *p,
-		tmpPath:        w.tmpPath,
-		finalPath:      w.finalPath,
-	}, nil
 }

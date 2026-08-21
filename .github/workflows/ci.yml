@@ -1,0 +1,155 @@
+# Continuous integration for the instachron Go monorepo.
+#
+# This repository is not one Go module but sixteen: each service under services/
+# and each library under shared/ has its own go.mod, tied together for local
+# development by a go.work file. That shape drives everything below.
+#
+# In particular, go.work is deliberately NOT used here. A workspace makes every
+# module resolve its siblings from the local checkout, which papers over a
+# missing require or replace directive in an individual go.mod — the module
+# still builds locally and then fails for anyone who builds it on its own, which
+# is exactly what the Dockerfiles do (they run with GOWORK=off). Running CI with
+# GOWORK=off is what catches that class of mistake before it reaches an image
+# build.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same branch makes an in-flight run obsolete, so cancel it
+# rather than paying for both.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Every module is built and tested on its own, as described above.
+  GOWORK: off
+
+jobs:
+  format:
+    name: gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+          cache: false
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l $(find services shared -name '*.go'))"
+          if [ -n "$unformatted" ]; then
+            printf 'These files are not gofmt-formatted (run: just fmt):\n%s\n' "$unformatted"
+            exit 1
+          fi
+
+  build-vet-test:
+    name: build, vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+
+      # Each module is entered separately because "go build ./..." from the repo
+      # root would only see the module it is standing in.
+      - name: Build, vet and test every module
+        run: |
+          status=0
+          for module in $(find services shared -name go.mod | xargs -n1 dirname | sort); do
+            printf '\n=== %s ===\n' "$module"
+            (
+              cd "$module"
+              go build ./... &&
+              go vet ./... &&
+              go test ./...
+            ) || status=1
+          done
+          exit $status
+
+  race:
+    name: tests under the race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+
+      # Almost everything here moves camera frames between goroutines, so the
+      # race detector earns its keep. It is a separate job because it roughly
+      # triples how long the tests take.
+      - name: Run tests with -race
+        run: |
+          status=0
+          for module in $(find services shared -name go.mod | xargs -n1 dirname | sort); do
+            printf '\n=== %s ===\n' "$module"
+            (cd "$module" && go test -race ./...) || status=1
+          done
+          exit $status
+
+  errcheck:
+    name: unchecked errors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+      - name: Install errcheck
+        run: go install github.com/kisielk/errcheck@v1.20.0
+      - name: Check for ignored errors
+        run: |
+          status=0
+          for module in $(find services shared -name go.mod | xargs -n1 dirname | sort); do
+            printf '\n=== %s ===\n' "$module"
+            (cd "$module" && errcheck ./...) || status=1
+          done
+          exit $status
+
+  tidy:
+    name: go.mod is tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+
+      # A go.mod that is not tidy is how a module ends up missing a require it
+      # depends on, which the workspace hides during local development.
+      - name: Check every module is tidy
+        run: |
+          status=0
+          for module in $(find services shared -name go.mod | xargs -n1 dirname | sort); do
+            (cd "$module" && cp go.mod go.mod.bak && { [ -f go.sum ] && cp go.sum go.sum.bak || true; } && go mod tidy)
+            if ! diff -q "$module/go.mod" "$module/go.mod.bak" >/dev/null; then
+              printf '%s/go.mod is not tidy (run: cd %s && go mod tidy)\n' "$module" "$module"
+              status=1
+            fi
+            (cd "$module" && mv go.mod.bak go.mod && { [ -f go.sum.bak ] && mv go.sum.bak go.sum || true; })
+          done
+          exit $status
+
+  docker:
+    name: container images build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Dockerfiles copy each shared module they depend on by hand, so a new
+      # dependency that nobody added a COPY line for breaks the image build and
+      # nothing else. Building them here is what catches that.
+      - name: Build every service image
+        run: |
+          status=0
+          for dockerfile in services/*/Dockerfile; do
+            service="$(basename "$(dirname "$dockerfile")")"
+            printf '\n=== %s ===\n' "$service"
+            docker build -f "$dockerfile" -t "instachron/$service:ci" . || status=1
+          done
+          exit $status

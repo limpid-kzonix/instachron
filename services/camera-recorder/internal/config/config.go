@@ -4,20 +4,32 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
+
+	"github.com/w0rxbend/instachron/shared/envconf"
 )
 
+// DefaultPath is the config file the service reads when CONFIG_FILE is unset.
 const DefaultPath = "config.json"
 
+// Config is the whole camera-recorder configuration, as read from the JSON
+// config file and then overridden by environment variables.
 type Config struct {
 	HTTPAddr        string          `json:"http_addr"`
 	UpstreamTCPAddr string          `json:"upstream_tcp_addr"`
 	Recording       RecordingConfig `json:"recording"`
 	Storage         StorageConfig   `json:"storage"`
 	FFmpeg          FFmpegConfig    `json:"ffmpeg"`
+
+	// The two duration fields below are the parsed form of the matching string
+	// fields in Recording. Load fills them in after Validate has confirmed the
+	// strings parse, so nothing downstream has to handle a parse error again.
+	segmentDuration time.Duration
+	inactiveTimeout time.Duration
 }
 
+// RecordingConfig controls how incoming frames become segment files: how many
+// of them are kept, how long each file covers, and how big it may grow.
 type RecordingConfig struct {
 	OutputFPS             int    `json:"output_fps"`
 	TimelapseFactor       int    `json:"timelapse_factor"`
@@ -28,17 +40,23 @@ type RecordingConfig struct {
 	InactiveCloseDuration string `json:"inactive_close_duration"`
 }
 
+// StorageConfig says where finished recordings are written. Only the "local"
+// type (a directory on disk) is supported today.
 type StorageConfig struct {
 	Type    string `json:"type"`
 	RootDir string `json:"root_dir"`
 }
 
+// FFmpegConfig holds the settings passed to the ffmpeg process that encodes
+// each segment.
 type FFmpegConfig struct {
 	Path   string `json:"path"`
 	Preset string `json:"preset"`
 	CRF    int    `json:"crf"`
 }
 
+// Defaults returns the configuration used when no config file is present. Every
+// field is set, and the result passes Validate.
 func Defaults() Config {
 	return Config{
 		HTTPAddr:        ":8094",
@@ -64,6 +82,9 @@ func Defaults() Config {
 	}
 }
 
+// Load reads the config file at path (or starts from Defaults when path is
+// empty), applies the environment-variable overrides, and validates the result.
+// An os.ErrNotExist error means the file itself was missing.
 func Load(path string) (Config, error) {
 	cfg := Defaults()
 	if path != "" {
@@ -79,19 +100,28 @@ func Load(path string) (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
+	// Validate already rejected unparseable values, so these cannot fail here.
+	cfg.segmentDuration, _ = time.ParseDuration(cfg.Recording.SegmentRawDuration)
+	cfg.inactiveTimeout, _ = time.ParseDuration(cfg.Recording.InactiveCloseDuration)
 	return cfg, nil
 }
 
-func (c Config) SegmentRawDuration() time.Duration {
-	d, _ := time.ParseDuration(c.Recording.SegmentRawDuration)
-	return d
+// SegmentDuration returns how much wall-clock time one recorded segment covers,
+// parsed from Recording.SegmentRawDuration. It is only meaningful on a Config
+// that came back from Load.
+func (c Config) SegmentDuration() time.Duration {
+	return c.segmentDuration
 }
 
-func (c Config) InactiveCloseDuration() time.Duration {
-	d, _ := time.ParseDuration(c.Recording.InactiveCloseDuration)
-	return d
+// InactiveTimeout returns how long a camera may go without delivering a frame
+// before its open segment is closed, parsed from Recording.InactiveCloseDuration.
+// It is only meaningful on a Config that came back from Load.
+func (c Config) InactiveTimeout() time.Duration {
+	return c.inactiveTimeout
 }
 
+// Validate reports the first configuration value that would stop the service
+// from running correctly, or nil when every value is usable.
 func (c Config) Validate() error {
 	if c.HTTPAddr == "" {
 		return fmt.Errorf("http_addr is required")
@@ -138,48 +168,23 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// applyEnv overlays environment variables on top of a config that has already
+// been read from the config file. Every setting keeps whatever the file gave it
+// unless the matching variable is set, which is what the fallback argument to
+// each envconf reader expresses: "leave this alone".
 func applyEnv(c *Config) {
-	if v := os.Getenv("HTTP_ADDR"); v != "" {
-		c.HTTPAddr = v
-	}
-	if v := os.Getenv("UPSTREAM_TCP_ADDR"); v != "" {
-		c.UpstreamTCPAddr = v
-	}
-	if v := os.Getenv("STORAGE_ROOT_DIR"); v != "" {
-		c.Storage.RootDir = v
-	}
-	if v := os.Getenv("FFMPEG_PATH"); v != "" {
-		c.FFmpeg.Path = v
-	}
-	if v := os.Getenv("FFMPEG_PRESET"); v != "" {
-		c.FFmpeg.Preset = v
-	}
-	envInt("OUTPUT_FPS", &c.Recording.OutputFPS)
-	envInt("TIMELAPSE_FACTOR", &c.Recording.TimelapseFactor)
-	envInt64("MAX_FILE_BYTES", &c.Recording.MaxFileBytes)
-	envInt("KEEP_FILES_PER_CAMERA", &c.Recording.KeepFilesPerCamera)
-	envInt("QUEUE_SIZE_PER_CAMERA", &c.Recording.QueueSizePerCamera)
-	envInt("FFMPEG_CRF", &c.FFmpeg.CRF)
-	if v := os.Getenv("SEGMENT_RAW_DURATION"); v != "" {
-		c.Recording.SegmentRawDuration = v
-	}
-	if v := os.Getenv("INACTIVE_CLOSE_DURATION"); v != "" {
-		c.Recording.InactiveCloseDuration = v
-	}
-}
+	c.HTTPAddr = envconf.String("HTTP_ADDR", c.HTTPAddr)
+	c.UpstreamTCPAddr = envconf.String("UPSTREAM_TCP_ADDR", c.UpstreamTCPAddr)
+	c.Storage.RootDir = envconf.String("STORAGE_ROOT_DIR", c.Storage.RootDir)
+	c.FFmpeg.Path = envconf.String("FFMPEG_PATH", c.FFmpeg.Path)
+	c.FFmpeg.Preset = envconf.String("FFMPEG_PRESET", c.FFmpeg.Preset)
+	c.FFmpeg.CRF = envconf.Int("FFMPEG_CRF", c.FFmpeg.CRF)
 
-func envInt(key string, target *int) {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			*target = n
-		}
-	}
-}
-
-func envInt64(key string, target *int64) {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			*target = n
-		}
-	}
+	c.Recording.OutputFPS = envconf.Int("OUTPUT_FPS", c.Recording.OutputFPS)
+	c.Recording.TimelapseFactor = envconf.Int("TIMELAPSE_FACTOR", c.Recording.TimelapseFactor)
+	c.Recording.MaxFileBytes = envconf.Int64("MAX_FILE_BYTES", c.Recording.MaxFileBytes)
+	c.Recording.KeepFilesPerCamera = envconf.Int("KEEP_FILES_PER_CAMERA", c.Recording.KeepFilesPerCamera)
+	c.Recording.QueueSizePerCamera = envconf.Int("QUEUE_SIZE_PER_CAMERA", c.Recording.QueueSizePerCamera)
+	c.Recording.SegmentRawDuration = envconf.String("SEGMENT_RAW_DURATION", c.Recording.SegmentRawDuration)
+	c.Recording.InactiveCloseDuration = envconf.String("INACTIVE_CLOSE_DURATION", c.Recording.InactiveCloseDuration)
 }

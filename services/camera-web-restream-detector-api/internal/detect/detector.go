@@ -3,11 +3,9 @@ package detect
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"image"
 	"log"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,18 +45,6 @@ func DefaultConfig() Config {
 	}
 }
 
-func LoadConfig(path string) (Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Config{}, err
-	}
-	cfg := DefaultConfig()
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return Config{}, err
-	}
-	return cfg, nil
-}
-
 // OutputLayout describes how the model's flat output array is indexed.
 type OutputLayout struct {
 	NumBoxes    int
@@ -90,7 +76,91 @@ type Detector struct {
 	frameCount atomic.Int64 // monotonic counter for decimation
 }
 
-var ortOnce sync.Once
+// ONNX Runtime keeps one environment per process, so initialisation has to
+// happen exactly once no matter how many detectors are built. ortOnce enforces
+// that, and ortInitErr remembers the outcome: without it a second caller would
+// see a nil error and go on to use an environment that was never initialised.
+var (
+	ortOnce    sync.Once
+	ortInitErr error
+)
+
+// initORT initialises the process-wide ONNX Runtime environment on the first
+// call and returns the result of that first call on every later one.
+//
+// Only the first caller's cfg.OrtLibPath has any effect, because the shared
+// library is loaded once. That is not a limitation in practice — this service
+// builds a single detector — but it is why the path is read here rather than
+// stored on the Detector.
+func initORT(cfg Config) error {
+	ortOnce.Do(func() {
+		if cfg.OrtLibPath != "" {
+			ort.SetSharedLibraryPath(cfg.OrtLibPath)
+		}
+		ortInitErr = ort.InitializeEnvironment(ort.WithLogLevelError())
+	})
+	return ortInitErr
+}
+
+// newTensors allocates the fixed input and output buffers that every inference
+// reuses, sized from cfg and the probed output layout.
+//
+// These are allocated by the C library rather than by Go, so the garbage
+// collector will not reclaim them: each one has to be handed back with
+// Destroy. That is why the failure path below destroys the input tensor before
+// returning — an error after a successful allocation would otherwise leak it,
+// and the caller has no handle to free something it never received.
+func newTensors(cfg Config, layout OutputLayout) (input, output *ort.Tensor[float32], err error) {
+	// The input is always one RGB image at the model's configured size, in
+	// channel-first order: [batch=1, channels=3, height, width].
+	inputShape := ort.NewShape(1, 3, int64(cfg.InputHeight), int64(cfg.InputWidth))
+	input, err = ort.NewEmptyTensor[float32](inputShape)
+	if err != nil {
+		return nil, nil, fmt.Errorf("input tensor: %w", err)
+	}
+
+	// The output shape depends on how the model was exported; both orderings
+	// hold the same numbers, so only the axis order differs.
+	outputShape := ort.NewShape(1, int64(layout.NumChannels), int64(layout.NumBoxes))
+	if layout.Transposed {
+		outputShape = ort.NewShape(1, int64(layout.NumBoxes), int64(layout.NumChannels))
+	}
+	output, err = ort.NewEmptyTensor[float32](outputShape)
+	if err != nil {
+		_ = input.Destroy()
+		return nil, nil, fmt.Errorf("output tensor: %w", err)
+	}
+	return input, output, nil
+}
+
+// allowedClassIDs turns the configured list of class names into the set of
+// numeric class IDs the model uses, so filtering a detection later is a map
+// lookup rather than a string comparison.
+//
+// An empty list returns nil, which every caller reads as "no filter, keep
+// everything" — that is the difference between an empty set and no set at all,
+// and it is why the return value is nil rather than an empty map. A name that
+// is not a known class is reported and skipped, so one typo in a config file
+// costs that one class rather than silently filtering everything away.
+func allowedClassIDs(names []string, logger *log.Logger) map[int]struct{} {
+	if len(names) == 0 {
+		return nil
+	}
+	nameToID := make(map[string]int, len(CocoClasses))
+	for i, name := range CocoClasses {
+		nameToID[name] = i
+	}
+	allowed := make(map[int]struct{}, len(names))
+	for _, name := range names {
+		id, ok := nameToID[name]
+		if !ok {
+			logger.Printf("allowed_classes: unknown class name %q (ignored)", name)
+			continue
+		}
+		allowed[id] = struct{}{}
+	}
+	return allowed
+}
 
 // New initialises the ONNX Runtime environment (once per process) and loads the model.
 // logger is used for debug output when cfg.Debug is true; pass nil to use the default logger.
@@ -98,15 +168,8 @@ func New(cfg Config, logger *log.Logger) (*Detector, error) {
 	if logger == nil {
 		logger = log.Default()
 	}
-	var initErr error
-	ortOnce.Do(func() {
-		if cfg.OrtLibPath != "" {
-			ort.SetSharedLibraryPath(cfg.OrtLibPath)
-		}
-		initErr = ort.InitializeEnvironment(ort.WithLogLevelError())
-	})
-	if initErr != nil {
-		return nil, fmt.Errorf("ort init: %w", initErr)
+	if err := initORT(cfg); err != nil {
+		return nil, fmt.Errorf("ort init: %w", err)
 	}
 
 	// Probe the model to discover actual tensor names and output shape.
@@ -115,25 +178,11 @@ func New(cfg Config, logger *log.Logger) (*Detector, error) {
 	if err != nil {
 		return nil, fmt.Errorf("probe model: %w", err)
 	}
-	layout := probe.Layout
-	logger.Printf("model probe: input=%q output=%q shape=%+v", probe.InputName, probe.OutputName, layout)
+	logger.Printf("model probe: input=%q output=%q shape=%+v", probe.InputName, probe.OutputName, probe.Layout)
 
-	inputShape := ort.NewShape(1, 3, int64(cfg.InputHeight), int64(cfg.InputWidth))
-	inputTensor, err := ort.NewEmptyTensor[float32](inputShape)
+	inputTensor, outputTensor, err := newTensors(cfg, probe.Layout)
 	if err != nil {
-		return nil, fmt.Errorf("input tensor: %w", err)
-	}
-
-	var outputShape ort.Shape
-	if layout.Transposed {
-		outputShape = ort.NewShape(1, int64(layout.NumBoxes), int64(layout.NumChannels))
-	} else {
-		outputShape = ort.NewShape(1, int64(layout.NumChannels), int64(layout.NumBoxes))
-	}
-	outputTensor, err := ort.NewEmptyTensor[float32](outputShape)
-	if err != nil {
-		inputTensor.Destroy()
-		return nil, fmt.Errorf("output tensor: %w", err)
+		return nil, err
 	}
 
 	session, err := ort.NewAdvancedSession(
@@ -145,25 +194,14 @@ func New(cfg Config, logger *log.Logger) (*Detector, error) {
 		nil,
 	)
 	if err != nil {
-		inputTensor.Destroy()
-		outputTensor.Destroy()
+		// Same reasoning as in newTensors: nothing else will free these.
+		_ = inputTensor.Destroy()
+		_ = outputTensor.Destroy()
 		return nil, fmt.Errorf("session: %w", err)
 	}
 
-	var allowedIDs map[int]struct{}
-	if len(cfg.AllowedClasses) > 0 {
-		allowedIDs = make(map[int]struct{}, len(cfg.AllowedClasses))
-		nameToID := make(map[string]int, len(CocoClasses))
-		for i, name := range CocoClasses {
-			nameToID[name] = i
-		}
-		for _, name := range cfg.AllowedClasses {
-			if id, ok := nameToID[name]; ok {
-				allowedIDs[id] = struct{}{}
-			} else {
-				logger.Printf("allowed_classes: unknown class name %q (ignored)", name)
-			}
-		}
+	allowed := allowedClassIDs(cfg.AllowedClasses, logger)
+	if allowed != nil {
 		logger.Printf("class filter: only showing %v", cfg.AllowedClasses)
 	}
 
@@ -172,8 +210,8 @@ func New(cfg Config, logger *log.Logger) (*Detector, error) {
 		session:      session,
 		inputTensor:  inputTensor,
 		outputTensor: outputTensor,
-		layout:       layout,
-		allowedIDs:   allowedIDs,
+		layout:       probe.Layout,
+		allowedIDs:   allowed,
 		logger:       logger,
 		bufPool:      sync.Pool{New: func() any { return new(bytes.Buffer) }},
 	}
@@ -237,11 +275,20 @@ func probeModel(cfg Config) (modelProbe, error) {
 // Layout returns the probed output layout (useful for logging).
 func (d *Detector) Layout() OutputLayout { return d.layout }
 
+// String renders the layout in the order the numbers actually appear in the
+// model's output tensor, so a log line shows both the shape and its meaning.
+func (l OutputLayout) String() string {
+	if l.Transposed {
+		return fmt.Sprintf("transposed [1,%d,%d]", l.NumBoxes, l.NumChannels)
+	}
+	return fmt.Sprintf("channel-first [1,%d,%d]", l.NumChannels, l.NumBoxes)
+}
+
 // Destroy releases ORT resources. Call once when the detector is no longer needed.
 func (d *Detector) Destroy() {
-	d.session.Destroy()
-	d.inputTensor.Destroy()
-	d.outputTensor.Destroy()
+	_ = d.session.Destroy()
+	_ = d.inputTensor.Destroy()
+	_ = d.outputTensor.Destroy()
 }
 
 // Detect runs inference on jpeg, returning the detections and the annotated JPEG.
@@ -254,7 +301,7 @@ func (d *Detector) Detect(jpeg []byte) ([]Detection, []byte, error) {
 
 const detectEveryN = 15
 
-// Process implements restream.Processor.
+// Process runs inference and annotation for one frame.
 // Inference runs on every Nth frame to refresh detections; every frame is
 // annotated with the most recent detections so bounding boxes are always visible.
 func (d *Detector) Process(jpeg []byte, push func([]byte)) {
@@ -334,8 +381,14 @@ func (d *Detector) inferenceOnly(jpeg []byte) ([]Detection, error) {
 		d.logger.Printf("detect debug: output max_value=%.4f layout=%+v", maxScore, d.layout)
 	}
 
-	dets := parseOutput(raw, d.layout, d.cfg.ConfThreshold, d.cfg.NMSThreshold,
-		lb, src.Bounds().Dx(), src.Bounds().Dy())
+	dets := parseOutput(raw, parseParams{
+		Layout:        d.layout,
+		ConfThreshold: d.cfg.ConfThreshold,
+		NMSThreshold:  d.cfg.NMSThreshold,
+		Letterbox:     lb,
+		OrigW:         src.Bounds().Dx(),
+		OrigH:         src.Bounds().Dy(),
+	})
 
 	if d.allowedIDs != nil {
 		filtered := dets[:0]

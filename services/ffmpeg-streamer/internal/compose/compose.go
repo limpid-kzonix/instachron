@@ -10,23 +10,25 @@ import (
 	"image/jpeg"
 	"math"
 	"sort"
+
+	"github.com/w0rxbend/instachron/shared/streamproto"
 )
 
-// Canvas builds a single JPEG from the frames map keyed by uint32 camera ID.
+// Canvas builds a single JPEG from the frames map keyed by camera ID.
 // Returns nil if there are no frames to compose or decoding all frames fails.
-func Canvas(frames map[uint32][]byte, cellW, cellH int) ([]byte, error) {
+func Canvas(frames map[streamproto.CameraID][]byte, cellW, cellH int) ([]byte, error) {
 	if len(frames) == 0 {
 		return nil, nil
 	}
 
-	ids := make([]uint32, 0, len(frames))
+	ids := make([]streamproto.CameraID, 0, len(frames))
 	for id := range frames {
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
 	type cell struct {
-		id  uint32
+		id  streamproto.CameraID
 		img image.Image
 	}
 	cells := make([]cell, 0, len(ids))

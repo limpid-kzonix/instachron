@@ -78,6 +78,20 @@ func detectionsEqual(a, b Detection, tol float32) bool {
 
 // TestParseOutputLayoutsAgree feeds parseOutput the same logical detection in
 // both storage layouts and requires byte-identical results.
+// squareParams builds the parse settings used by the cases that feed the model
+// a frame that was already the model's own input size, so no letterbox mapping
+// is involved and detections come back in the coordinates they went in with.
+func squareParams(layout OutputLayout, lb letterboxResult) parseParams {
+	return parseParams{
+		Layout:        layout,
+		ConfThreshold: 0.5,
+		NMSThreshold:  0.5,
+		Letterbox:     lb,
+		OrigW:         640,
+		OrigH:         640,
+	}
+}
+
 func TestParseOutputLayoutsAgree(t *testing.T) {
 	boxes := []rawBox{
 		// A "car" (COCO class 2) centred at (100, 100), 50 wide and 40 tall.
@@ -89,10 +103,10 @@ func TestParseOutputLayoutsAgree(t *testing.T) {
 	layout := OutputLayout{NumBoxes: len(boxes), NumChannels: numChannels}
 
 	layout.Transposed = false
-	channelFirst := parseOutput(encodeBoxes(boxes, false), layout, 0.5, 0.5, identityLetterbox, 640, 640)
+	channelFirst := parseOutput(encodeBoxes(boxes, false), squareParams(layout, identityLetterbox))
 
 	layout.Transposed = true
-	boxesFirst := parseOutput(encodeBoxes(boxes, true), layout, 0.5, 0.5, identityLetterbox, 640, 640)
+	boxesFirst := parseOutput(encodeBoxes(boxes, true), squareParams(layout, identityLetterbox))
 
 	if !reflect.DeepEqual(channelFirst, boxesFirst) {
 		t.Fatalf("layouts disagree:\n channel-first: %+v\n boxes-first:   %+v", channelFirst, boxesFirst)
@@ -138,7 +152,7 @@ func TestParseOutputDrops(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, transposed := range []bool{false, true} {
 				layout := OutputLayout{NumBoxes: 1, NumChannels: numChannels, Transposed: transposed}
-				got := parseOutput(encodeBoxes([]rawBox{tt.box}, transposed), layout, 0.5, 0.5, identityLetterbox, 640, 640)
+				got := parseOutput(encodeBoxes([]rawBox{tt.box}, transposed), squareParams(layout, identityLetterbox))
 				if len(got) != 0 {
 					t.Errorf("transposed=%v: got %+v, want no detections", transposed, got)
 				}
@@ -164,7 +178,10 @@ func TestParseOutputUnletterbox(t *testing.T) {
 
 	for _, transposed := range []bool{false, true} {
 		layout := OutputLayout{NumBoxes: 1, NumChannels: numChannels, Transposed: transposed}
-		got := parseOutput(encodeBoxes([]rawBox{box}, transposed), layout, 0.5, 0.5, lb, 1280, 720)
+		got := parseOutput(encodeBoxes([]rawBox{box}, transposed), parseParams{
+			Layout: layout, ConfThreshold: 0.5, NMSThreshold: 0.5,
+			Letterbox: lb, OrigW: 1280, OrigH: 720,
+		})
 		if len(got) != 1 {
 			t.Fatalf("transposed=%v: got %d detections, want 1", transposed, len(got))
 		}

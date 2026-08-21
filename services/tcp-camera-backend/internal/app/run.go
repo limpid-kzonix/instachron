@@ -2,24 +2,25 @@ package app
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"log"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"syscall"
 
 	"github.com/w0rxbend/instachron/services/tcp-camera-backend/internal/config"
 	"github.com/w0rxbend/instachron/services/tcp-camera-backend/internal/publisher"
 	"github.com/w0rxbend/instachron/services/tcp-camera-backend/internal/server"
 )
 
-func Run() {
+// Run starts the TCP frame server and the IPC publisher, and returns once ctx is
+// cancelled or the server stops with an error. Deciding when to cancel ctx (a
+// signal from the operating system, a test finishing) is left to the caller.
+func Run(ctx context.Context) error {
 	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
 	cfg := config.LoadFromEnv()
 
 	if err := os.MkdirAll(filepath.Dir(cfg.IPCSocketPath), 0o755); err != nil {
-		logger.Fatalf("create IPC socket directory: %v", err)
+		return fmt.Errorf("create IPC socket directory: %w", err)
 	}
 
 	pub := publisher.New(cfg.IPCSocketPath, logger)
@@ -31,16 +32,14 @@ func Run() {
 		Logger:        logger,
 	})
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	go func() {
 		if err := pub.Listen(ctx); err != nil {
 			logger.Printf("IPC publisher error: %v", err)
 		}
 	}()
 
-	if err := srv.ListenAndServe(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		logger.Fatalf("server failed: %v", err)
+	if err := srv.ListenAndServe(ctx); err != nil {
+		return fmt.Errorf("server failed: %w", err)
 	}
+	return nil
 }

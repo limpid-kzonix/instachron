@@ -8,6 +8,8 @@ import (
 	"os"
 	"sync"
 
+	"github.com/w0rxbend/instachron/shared/streamproto"
+
 	"github.com/w0rxbend/instachron/shared/frameipc"
 )
 
@@ -15,7 +17,7 @@ const ipcChannelSize = 64
 
 type consumerConn struct {
 	conn net.Conn
-	ch   chan frameipc.Msg
+	ch   chan frameipc.Frame
 }
 
 // Publisher listens on a Unix domain socket and fans out IPC messages
@@ -52,17 +54,17 @@ func (p *Publisher) Listen(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		_ = ln.Close()
 		p.mu.Lock()
 		for c := range p.consumers {
-			c.conn.Close()
+			_ = c.conn.Close()
 		}
 		p.mu.Unlock()
 	}()
 
 	defer func() {
-		ln.Close()
-		os.Remove(p.socketPath)
+		_ = ln.Close()
+		_ = os.Remove(p.socketPath)
 		wg.Wait()
 	}()
 
@@ -80,7 +82,7 @@ func (p *Publisher) Listen(ctx context.Context) error {
 
 		c := &consumerConn{
 			conn: conn,
-			ch:   make(chan frameipc.Msg, ipcChannelSize),
+			ch:   make(chan frameipc.Frame, ipcChannelSize),
 		}
 
 		p.mu.Lock()
@@ -97,7 +99,7 @@ func (p *Publisher) Listen(ctx context.Context) error {
 
 func (p *Publisher) serveConsumer(ctx context.Context, c *consumerConn) {
 	defer func() {
-		c.conn.Close()
+		_ = c.conn.Close()
 		p.mu.Lock()
 		delete(p.consumers, c)
 		p.mu.Unlock()
@@ -121,15 +123,15 @@ func (p *Publisher) serveConsumer(ctx context.Context, c *consumerConn) {
 	}
 }
 
-func (p *Publisher) Publish(cameraID uint32, jpeg []byte) {
-	p.fanOut(frameipc.Msg{Type: frameipc.TypeFrame, CameraID: cameraID, Payload: jpeg})
+func (p *Publisher) Publish(cameraID streamproto.CameraID, jpeg []byte) {
+	p.fanOut(frameipc.Frame{Kind: frameipc.KindFrame, CameraID: cameraID, Payload: jpeg})
 }
 
-func (p *Publisher) PublishOffline(cameraID uint32) {
-	p.fanOut(frameipc.Msg{Type: frameipc.TypeOffline, CameraID: cameraID})
+func (p *Publisher) PublishOffline(cameraID streamproto.CameraID) {
+	p.fanOut(frameipc.Frame{Kind: frameipc.KindOffline, CameraID: cameraID})
 }
 
-func (p *Publisher) fanOut(msg frameipc.Msg) {
+func (p *Publisher) fanOut(msg frameipc.Frame) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
