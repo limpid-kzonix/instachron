@@ -54,10 +54,10 @@ func drawRect(img *image.NRGBA, x1, y1, x2, y2 int, col color.NRGBA) {
 
 func drawLabel(img *image.NRGBA, text string, x, y int, col color.NRGBA) {
 	const (
-		charW  = 7
-		charH  = 13
-		padX   = 2
-		padY   = 2
+		charW = 7
+		charH = 13
+		padX  = 2
+		padY  = 2
 	)
 	tw := len(text)*charW + 2*padX
 	th := charH + 2*padY

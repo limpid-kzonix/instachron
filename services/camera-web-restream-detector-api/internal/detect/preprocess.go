@@ -53,8 +53,8 @@ func toTensor(img *image.NRGBA, buf []float32) {
 		for x := 0; x < w; x++ {
 			px := img.NRGBAAt(x, y)
 			i := y*w + x
-			buf[i] = float32(px.R) / 255.0           // R plane
-			buf[planeSize+i] = float32(px.G) / 255.0  // G plane
+			buf[i] = float32(px.R) / 255.0             // R plane
+			buf[planeSize+i] = float32(px.G) / 255.0   // G plane
 			buf[2*planeSize+i] = float32(px.B) / 255.0 // B plane
 		}
 	}
