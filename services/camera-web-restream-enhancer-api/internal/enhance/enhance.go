@@ -109,7 +109,7 @@ var filterRegistry = map[string]gift.Filter{
 }
 
 // Processor applies the enhancement pipeline to raw JPEG frames.
-// Process and ProcessCamera are safe for concurrent use.
+// ProcessCamera is the entry point, and is safe for concurrent use.
 type Processor struct {
 	cfgs    CameraConfigs
 	bufPool sync.Pool
@@ -121,11 +121,6 @@ func New(cfgs CameraConfigs) *Processor {
 		cfgs:    cfgs,
 		bufPool: sync.Pool{New: func() any { return new(bytes.Buffer) }},
 	}
-}
-
-// Process implements restream.Processor using the default config.
-func (e *Processor) Process(jpeg []byte, push func([]byte)) {
-	push(e.process(jpeg, e.cfgs.Default))
 }
 
 // ProcessCamera looks up the per-camera config (falling back to Default) and
@@ -147,33 +142,8 @@ func (e *Processor) process(jpeg []byte, cfg Config) []byte {
 		return jpeg
 	}
 
-	// adaptive dark correction
-	if cfg.DarkThreshold > 0 {
-		lum := avgLuminance32(img)
-		if lum < cfg.DarkThreshold {
-			factor := (cfg.DarkThreshold - lum) / cfg.DarkThreshold
-			if cfg.BrightnessMax > 0 {
-				img = imaging.AdjustBrightness(img, factor*cfg.BrightnessMax)
-			}
-			if cfg.ContrastMax > 0 {
-				img = imaging.AdjustContrast(img, factor*cfg.ContrastMax)
-			}
-		}
-	}
-
-	// gift filter chain
-	var filters []gift.Filter
-	for _, key := range cfg.Filters {
-		if f, ok := filterRegistry[key]; ok {
-			filters = append(filters, f)
-		}
-	}
-	if len(filters) > 0 {
-		g := gift.New(filters...)
-		dst := image.NewNRGBA(g.Bounds(img.Bounds()))
-		g.Draw(dst, img)
-		img = dst
-	}
+	img = applyDarkCorrection(img, cfg)
+	img = applyFilters(img, cfg.Filters)
 
 	buf := e.bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
@@ -186,6 +156,46 @@ func (e *Processor) process(jpeg []byte, cfg Config) []byte {
 	out := make([]byte, buf.Len())
 	copy(out, buf.Bytes())
 	return out
+}
+
+// applyDarkCorrection brightens a frame that came out too dark, by an amount
+// that depends on how dark it is: a frame at half the threshold luminance gets
+// half of BrightnessMax and half of ContrastMax, and a frame at or above the
+// threshold is returned untouched. A DarkThreshold of zero turns the pass off.
+func applyDarkCorrection(img image.Image, cfg Config) image.Image {
+	if cfg.DarkThreshold > 0 {
+		lum := avgLuminance32(img)
+		if lum < cfg.DarkThreshold {
+			factor := (cfg.DarkThreshold - lum) / cfg.DarkThreshold
+			if cfg.BrightnessMax > 0 {
+				img = imaging.AdjustBrightness(img, factor*cfg.BrightnessMax)
+			}
+			if cfg.ContrastMax > 0 {
+				img = imaging.AdjustContrast(img, factor*cfg.ContrastMax)
+			}
+		}
+	}
+	return img
+}
+
+// applyFilters runs img through the named filters from filterRegistry, in the
+// order given. Names that are not in the registry are skipped, so a typo in a
+// config file costs that one filter rather than the whole frame. When no name
+// matches, img is returned unchanged.
+func applyFilters(img image.Image, keys []string) image.Image {
+	var filters []gift.Filter
+	for _, key := range keys {
+		if f, ok := filterRegistry[key]; ok {
+			filters = append(filters, f)
+		}
+	}
+	if len(filters) > 0 {
+		g := gift.New(filters...)
+		dst := image.NewNRGBA(g.Bounds(img.Bounds()))
+		g.Draw(dst, img)
+		img = dst
+	}
+	return img
 }
 
 // avgLuminance32 computes the average BT.601 luminance (0–1) by downsampling
